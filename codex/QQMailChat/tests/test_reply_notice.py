@@ -1,4 +1,4 @@
-"""Exercise queued email replies and SMTP threading without a live mailbox."""
+"""Exercise QQMailChat routing and notifications without a live mailbox."""
 
 import contextlib
 import importlib.util
@@ -267,6 +267,49 @@ class ReplyNotificationTest(unittest.TestCase):
         with patch.object(inbox, "submit_command", side_effect=error), self.assertRaises(inbox.RpcError):
             inbox.submit_or_record_failure(self.db, self.config, command, 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM failed_replies").fetchone(), (0,))
+
+
+class NoticeProjectNameTest(unittest.TestCase):
+    def setUp(self):
+        profile = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(mail, "CODEX_PROFILE", profile))
+        self.db = self.enterContext(contextlib.closing(sqlite3.connect(profile / "state_5.sqlite")))
+        self.db.executescript("""
+            CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, project_id TEXT, cwd TEXT);
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE project_roots (project_id TEXT, path TEXT);
+        """)
+        with self.db:
+            self.db.execute("INSERT INTO threads VALUES (?, ?, NULL, ?)", (
+                THREAD, "测试会话", r"\\?\X:\Projects\Tools",
+            ))
+            self.db.execute("INSERT INTO projects VALUES ('tools', '工具工程')")
+            self.db.execute("INSERT INTO project_roots VALUES ('tools', 'x:/projects/tools/')")
+        self.event = {"session_id": THREAD}
+
+    def test_subject_uses_unique_workspace_project_for_legacy_chat(self):
+        subject, _ = mail.notice_content(self.event, "测试问题")
+        self.assertEqual(subject, "[完成通知][工具工程][测试会话]")
+
+    def test_explicit_assignment_takes_precedence(self):
+        with self.db:
+            self.db.execute("INSERT INTO projects VALUES ('explicit', '指定工程')")
+            self.db.execute("UPDATE threads SET project_id='explicit'")
+        self.assertEqual(mail.project_and_chat(self.event), ("指定工程", "测试会话"))
+
+    def test_ambiguous_workspace_retains_chat_name(self):
+        with self.db:
+            self.db.execute("INSERT INTO projects VALUES ('other', '另一工程')")
+            self.db.execute("INSERT INTO project_roots VALUES ('other', 'X:/Projects/Tools')")
+        self.assertEqual(mail.project_and_chat(self.event), ("未归属项目", "测试会话"))
+
+    def test_unavailable_workspace_lookup_retains_chat_name(self):
+        with self.db:
+            self.db.execute("DROP TABLE project_roots")
+        self.assertEqual(mail.project_and_chat(self.event), ("未归属项目", "测试会话"))
+
+    def test_extended_unc_root_matches_standard_unc(self):
+        self.assertEqual(mail.workspace_key(r"\\?\UNC\Server\Share\Tools"), mail.workspace_key(r"\\server\share\tools"))
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File (Join-Path $m
 结束后邮件通知 name@example.com
 ```
 
-本轮结束时发送一次。邮件主题含项目名和会话名，正文包含本轮问题及最终答复。需要每轮都收到通知时，复制目标会话链接，再执行以下命令。`enable` 可再次运行以更换收件人，本轮显式指定的地址优先。
+本轮结束时发送一次。邮件主题含项目名和会话名，正文包含本轮问题及最终答复。会话通过工作目录归入项目时，主题会使用与该目录唯一匹配的已注册项目名。需要每轮都收到通知时，复制目标会话链接，再执行以下命令。`enable` 可再次运行以更换收件人，本轮显式指定的地址优先。
 
 ```powershell
 $chat = Get-Clipboard -Raw
