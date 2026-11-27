@@ -34,6 +34,7 @@ class ReplyNotificationTest(unittest.TestCase):
         self.enterContext(patch.multiple(
             mail, CODEX_PROFILE=root, INBOX_STATE=root / "inbox-state.sqlite3",
             SETTINGS=root / "settings.json", TURN_NOTICES=root / "turn-notices.sqlite3",
+            NOTICE_PREFERENCES=root / "notice-preferences.sqlite3",
             REPLY_ROUTES=root / "reply-routes.sqlite3", ROUTES=root / "routes",
         ))
         self.db = self.enterContext(contextlib.closing(sqlite3.connect(mail.INBOX_STATE)))
@@ -74,7 +75,7 @@ class ReplyNotificationTest(unittest.TestCase):
             server = connect.return_value.__enter__.return_value
             resolve.return_value = THREAD
             if busy:
-                resolve.side_effect = inbox.BusyThread()
+                resolve.side_effect = inbox.BusyThread(THREAD)
             inbox.submit_command(self.db, self.config, command, 1)
             inbox.submit_command(self.db, self.config, command, 1)
             server.call.assert_called_once()
@@ -89,6 +90,96 @@ class ReplyNotificationTest(unittest.TestCase):
 
     def record_turn(self, client_id):
         self.append(type="item_completed", turn_id="reply-turn", item={"type": "UserMessage", "client_id": client_id})
+
+    def submit_prompt(self, text, turn_id):
+        event = {"hook_event_name": "UserPromptSubmit", "session_id": THREAD, "turn_id": turn_id, "prompt": text}
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(event).encode("utf-8")))
+        output = io.StringIO()
+        with patch.object(mail.sys, "stdin", stdin), contextlib.redirect_stdout(output):
+            mail.run_prompt_hook()
+        return mail.turn_key(event), json.loads(output.getvalue())
+
+    def test_default_recipient_is_saved_and_reused_only_when_requested(self):
+        with patch.object(mail, "prompt_default_recipient", return_value=SENDER) as dialog:
+            first, result = self.submit_prompt("请完成任务。\n完成后邮件通知", "first")
+            self.assertIn("hookSpecificOutput", result)
+            self.assertEqual(mail.take_turn_notice(first), (SENDER, "请完成任务。"))
+            self.assertEqual(mail.take_turn_notice(first), (None, ""))
+            later, _ = self.submit_prompt("完成后邮件通知。", "later")
+            ordinary, _ = self.submit_prompt("继续下一项任务。", "ordinary")
+            self.assertEqual(mail.take_turn_notice(later), (SENDER, ""))
+            self.assertEqual(mail.take_turn_notice(ordinary), (None, ""))
+            dialog.assert_called_once()
+
+    def test_explicit_recipients_take_priority_without_replacing_the_default(self):
+        explicit = "override@example.com"
+        with patch.object(mail, "prompt_default_recipient", return_value=SENDER) as dialog:
+            first, _ = self.submit_prompt(f"完成后邮件通知{explicit}\n完成后邮件通知", "explicit")
+            dialog.assert_not_called()
+            self.assertFalse(mail.NOTICE_PREFERENCES.exists())
+            self.submit_prompt("完成后邮件通知", "explicit")
+            self.assertEqual(mail.take_turn_notice(first), (explicit, ""))
+            later, _ = self.submit_prompt("完成后邮件通知", "default")
+            self.assertEqual(mail.take_turn_notice(later), (SENDER, ""))
+            dialog.assert_called_once()
+
+    def test_cancel_leaves_the_default_unset_for_the_next_request(self):
+        with patch.object(mail, "prompt_default_recipient", side_effect=[None, SENDER]):
+            first, result = self.submit_prompt("完成后邮件通知", "cancel")
+            self.assertIn("systemMessage", result)
+            self.assertEqual(mail.take_turn_notice(first), (None, ""))
+            later, _ = self.submit_prompt("完成后邮件通知", "retry")
+            self.assertEqual(mail.take_turn_notice(later), (SENDER, ""))
+
+    def test_edit_default_prefills_and_updates_only_future_notifications(self):
+        updated = "updated@example.com"
+        with patch.object(mail, "prompt_default_recipient", side_effect=[SENDER, updated, None]) as dialog:
+            first, _ = self.submit_prompt("完成后邮件通知", "first")
+            edit, result = self.submit_prompt("修改默认接收通知邮件地址", "edit")
+            self.assertIn("已保存", result["systemMessage"])
+            self.assertEqual(dialog.call_args.kwargs, {"edit": True, "current": SENDER})
+            self.assertEqual(mail.take_turn_notice(edit), (None, ""))
+            self.assertEqual(mail.take_turn_notice(first), (SENDER, ""))
+            self.submit_prompt("修改默认接收通知邮件地址", "cancel")
+            self.assertEqual(dialog.call_args.kwargs, {"edit": True, "current": updated})
+            later, _ = self.submit_prompt("完成后邮件通知", "later")
+            self.assertEqual(mail.take_turn_notice(later), (updated, ""))
+            self.assertEqual(dialog.call_count, 3)
+
+    def test_examples_and_invalid_addresses_do_not_open_the_dialog(self):
+        samples = (
+            "“完成后邮件通知”", "`完成后邮件通知`", "> 完成后邮件通知", "```\n完成后邮件通知\n```",
+            "例如：\n完成后邮件通知", "完成后邮件通知 xxx", "完成后邮件通知 `invalid`",
+            "完成后邮件通知a@example.com\n完成后邮件通知b@example.com\n完成后邮件通知",
+            "「修改默认接收通知邮件地址」", "```\n修改默认接收通知邮件地址\n```",
+        )
+        with patch.object(mail, "prompt_default_recipient") as dialog:
+            for index, prompt in enumerate(samples):
+                with self.subTest(prompt=prompt):
+                    turn, _ = self.submit_prompt(prompt, str(index))
+                    self.assertEqual(mail.take_turn_notice(turn), (None, ""))
+            dialog.assert_not_called()
+
+    def test_incoming_email_with_bare_notice_still_only_replies_to_sender(self):
+        command, _ = self.command_email("回复：" + SUBJECT, "请继续。\n完成后邮件通知", in_reply_to=ROOT_ID)
+        with (patch.object(inbox, "connect_codex") as connect,
+              patch.object(inbox, "resolve_chat", return_value=THREAD), contextlib.redirect_stdout(io.StringIO())):
+            inbox.submit_command(self.db, self.config, command, 1)
+        method, args = connect.return_value.__enter__.return_value.call.call_args.args
+        self.assertEqual(method, "thread/queue/add")
+        self.assertEqual(args["input"], [{"type": "text", "text": "请继续。"}])
+        self.assertEqual(self.db.execute("SELECT recipient FROM reply_notifications").fetchone(), (SENDER,))
+
+    def test_edit_command_from_email_stays_out_of_the_local_hook(self):
+        command, _ = self.command_email("回复：" + SUBJECT, "修改默认接收通知邮件地址", in_reply_to=ROOT_ID)
+        with (patch.object(inbox, "connect_codex") as connect,
+              patch.object(inbox, "resolve_chat", return_value=THREAD), contextlib.redirect_stdout(io.StringIO())):
+            inbox.submit_command(self.db, self.config, command, 1)
+        _, args = connect.return_value.__enter__.return_value.call.call_args.args
+        with patch.object(mail, "prompt_default_recipient") as dialog:
+            self.submit_prompt(args["input"][0]["text"], "inbox")
+            dialog.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT recipient FROM reply_notifications").fetchone(), (SENDER,))
 
     def test_completion_replies_in_thread_once(self):
         client_id = self.queue_reply(busy=True)
@@ -171,6 +262,35 @@ class ReplyNotificationTest(unittest.TestCase):
         self.assertEqual([request.args[0] for request in server.call.call_args_list], ["thread/read", "thread/queue/add"])
         self.assertEqual(self.db.execute("SELECT recipient, thread_id FROM reply_notifications").fetchone(), (SENDER, THREAD))
 
+    def test_named_mail_queues_once_when_target_chat_is_busy(self):
+        command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
+        project = {"id": "tools", "name": "测试项目", "roots": [{"path": self.config["project_root"]}]}
+        chat = {"id": THREAD, "name": "测试会话", "cwd": self.config["project_root"]}
+        busy_resume = inbox.RpcError("thread/resume", {"code": -32600, "message": "thread already has an active writer"})
+        busy_start = inbox.RpcError("turn/start", {"code": -32600, "message": "thread has an active or pending turn"})
+        cases = (
+            ({**chat, "status": {"type": "active"}}, [{}], ["thread/queue/add"]),
+            (chat, [busy_resume, {}], ["thread/resume", "thread/queue/add"]),
+            (chat, [{"thread": chat}, busy_start, {}], ["thread/resume", "turn/start", "thread/queue/add"]),
+        )
+        # Run each busy path through name resolution and the same deduplication as the listener.
+        for listed_chat, responses, methods in cases:
+            with self.subTest(methods=methods), contextlib.closing(sqlite3.connect(":memory:")) as db:
+                inbox.init_state(db)
+                with patch.object(inbox, "connect_codex") as connect, contextlib.redirect_stdout(io.StringIO()):
+                    server = connect.return_value.__enter__.return_value
+                    server.pages.side_effect = [[project], [listed_chat]]
+                    server.call.side_effect = responses
+                    inbox.submit_or_record_failure(db, self.config, command, 1)
+                    inbox.submit_or_record_failure(db, self.config, command, 1)
+                requests = server.call.call_args_list
+                self.assertEqual([request.args[0] for request in requests], methods)
+                self.assertEqual(requests[-1].args[1]["threadId"], THREAD)
+                self.assertEqual(db.execute("SELECT thread_id, status FROM submissions").fetchall(), [(THREAD, "queued")])
+                self.assertEqual(db.execute("SELECT client_id, parent_id FROM reply_notifications").fetchall(), [
+                    (requests[-1].args[1]["clientUserMessageId"], PARENT_ID),
+                ])
+
     def test_new_email_chat_replies_on_completion_and_accepts_followup(self):
         subject = "[AI会话][测试目录][新会话]"
         command, _ = self.command_email(subject, "请开始。")
@@ -214,6 +334,37 @@ class ReplyNotificationTest(unittest.TestCase):
             inbox.submit_or_record_failure(self.db, self.config, command, 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reply_notifications").fetchone(), (0,))
         self.assertEqual(self.db.execute("SELECT status FROM failed_replies").fetchone(), ("pending",))
+
+    def test_poll_queues_verified_replies_from_recipient_outside_allowlist(self):
+        # Cover both registered reply routes and the mail server's authentication paths.
+        received = b"Received: from outbound.example.com by mx.qq.com\n"
+        dmarc = b"Authentication-Results: mx.qq.com; dmarc=pass header.from=example.com\n" + received
+        spf = (received + b"X-QQ-MID: trace\nX-QQ-XMAILINFO: trace\n"
+               b"Authentication-Results: mx.qq.com; spf=pass smtp.mailfrom=author@example.com\n")
+        messages = {
+            1: dmarc + self.raw_email("Re: " + SUBJECT, "按回复头继续。", in_reply_to=ROOT_ID),
+            2: spf + self.raw_email("回复：" + SUBJECT, "按主题继续。", message_id="<topic@example.com>"),
+            3: dmarc + self.raw_email("Re: " + SUBJECT, "其他发件人。", in_reply_to=ROOT_ID,
+                                      message_id="<other@example.com>", sender="other@example.com"),
+            4: self.raw_email("Re: " + SUBJECT, "未验证的发件人。", in_reply_to=ROOT_ID,
+                              message_id="<unverified@example.com>"),
+        }
+        box = Mock()
+        box.response.return_value = ("UIDVALIDITY", [b"42"])
+        box.uid.return_value = ("OK", [b"1 2 3 4"])
+        inbox.checkpoint(self.db, MAILBOX, 42, 0)
+        config = {**self.config, "senders": [MAILBOX]}
+        with (patch.object(inbox, "connect_codex") as connect,
+              patch.object(inbox, "inbox_connection", return_value=contextlib.nullcontext(box)),
+              patch.object(inbox, "read_message", side_effect=lambda _, uid: messages[uid]),
+              contextlib.redirect_stdout(io.StringIO())):
+            server = connect.return_value.__enter__.return_value
+            server.call.return_value = {"thread": {"id": THREAD}}
+            inbox.poll(self.db, config)
+        queued = [args[1] for args, _ in server.call.call_args_list if args[0] == "thread/queue/add"]
+        self.assertEqual([(item["threadId"], item["input"][0]["text"]) for item in queued],
+                         [(THREAD, "按回复头继续。"), (THREAD, "按主题继续。")])
+        self.assertEqual(connect.call_count, 2)
 
     def test_explicit_id_does_not_inherit_reply_permissions(self):
         # A reply header on an explicit-ID command cannot bypass its normal sender checks.

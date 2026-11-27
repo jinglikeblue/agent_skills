@@ -7,13 +7,16 @@ import getpass
 import hashlib
 import json
 import ntpath
+import os
 import re
 import secrets
 import smtplib
 import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
+import time
 from contextlib import closing
 from ctypes import wintypes
 from email.errors import HeaderParseError
@@ -29,6 +32,7 @@ SETTINGS = Path(__file__).resolve().with_name("settings.json")
 CODEX_PROFILE = SETTINGS.parent.parent
 ROUTES = SETTINGS.with_name("routes")
 TURN_NOTICES = SETTINGS.with_name("turn-notices.sqlite3")
+NOTICE_PREFERENCES = SETTINGS.with_name("notice-preferences.sqlite3")
 REPLY_ROUTES = SETTINGS.with_name("reply-routes.sqlite3")
 INBOX_STATE = SETTINGS.with_name("inbox-state.sqlite3")
 UUID_TEXT = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
@@ -36,7 +40,7 @@ ROLLOUT_NAME = re.compile(rf"rollout-.+?-({UUID_TEXT})(?:_{UUID_TEXT})?\.jsonl",
 REPLY_PREFIX = re.compile(r"^(?:(?:re|回复)\s*[:：]\s*)+", re.IGNORECASE)
 
 # Match a direct instruction at the start of a clause. Wrapper punctuation is optional.
-MAILBOX = r"[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+"
+MAILBOX = r"[a-z0-9_%+\-]+(?:\.[a-z0-9_%+\-]+)*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+"
 RECIPIENT = rf"[`（(]?\s*(?P<recipient>{MAILBOX})\s*[`）)]?"
 WHEN_DONE = (
     r"(?:^|(?<=[，,。；;！？!?]))\s*(?:[-*+]\s+)?(?:\$qq-mail-notify\s+)?(?:请\s*)?(?:等|在)?\s*"
@@ -53,6 +57,10 @@ NOTICE_PATTERNS = (
     re.compile(WHEN_DONE + MAIL_ACTION + r"\s*(?:给|到|至)?\s*[:：]?\s*" + RECIPIENT + CLAUSE_END, re.IGNORECASE),
     re.compile(WHEN_DONE + r"给\s*" + RECIPIENT + r"\s*发(?:送)?\s*(?:一封|个)?\s*邮件" + CLAUSE_END, re.IGNORECASE),
 )
+DEFAULT_NOTICE_PATTERN = re.compile(WHEN_DONE + MAIL_ACTION + r"\s*[。；;！？!?.]?$", re.IGNORECASE)
+EDIT_DEFAULT_NOTICE = re.compile(r"(?:请\s*)?修改默认接收通知邮件地址\s*[。！!.]?")
+# Leave time for hook bookkeeping before the installer-configured 120 second timeout.
+RECIPIENT_DIALOG_TIMEOUT = 110
 QUOTED_TEXT = re.compile(r'“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』|"[^"\r\n]*"')
 EXAMPLE_LINE = re.compile(r"^(?:例如|比如|示例|样例|举例|引用|参考|格式示例)")
 
@@ -110,6 +118,42 @@ def write_json(path, value):
         pending_path.replace(path)
     finally:
         pending_path.unlink(missing_ok=True)
+
+
+def prompt_default_recipient(timeout, *, edit=False, current=""):
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    script = SETTINGS.with_name("qq-mail-recipient-window.ps1")
+    command = [str(powershell), "-NoProfile", "-STA", "-ExecutionPolicy", "RemoteSigned", "-File", str(script),
+               "-MailboxPattern", MAILBOX]
+    if edit:
+        command.append("-Edit")
+    result = subprocess.run(
+        command, input=current, capture_output=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW, timeout=timeout,
+    )
+    if result.returncode == 2:
+        return None
+    result.check_returncode()
+    return email_address(result.stdout)
+
+
+def get_default_recipient(*, edit=False):
+    deadline = time.monotonic() + RECIPIENT_DIALOG_TIMEOUT
+    with closing(sqlite3.connect(NOTICE_PREFERENCES, timeout=RECIPIENT_DIALOG_TIMEOUT)) as db, db:
+        # Serialize changes without locking the separate turn-notice database.
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("CREATE TABLE IF NOT EXISTS preferences (id INTEGER PRIMARY KEY CHECK (id=1), recipient TEXT NOT NULL)")
+        saved = db.execute("SELECT recipient FROM preferences WHERE id=1").fetchone()
+        current = saved[0] if saved else ""
+        if saved and not edit:
+            return email_address(current)
+        recipient = prompt_default_recipient(max(0, deadline - time.monotonic()), edit=edit, current=current)
+        if recipient:
+            db.execute(
+                "INSERT INTO preferences VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET recipient=excluded.recipient",
+                (recipient,),
+            )
+        return recipient
 
 
 def chat_id(reference):
@@ -292,6 +336,7 @@ def split_mail_request(prompt):
     if prompt.lstrip().startswith("# Files mentioned by the user:") and "## My request:" in prompt:
         prompt = prompt.split("## My request:", 1)[1]
     recipients = set()
+    use_default = False
     question = []
     fence = None
     after_example_label = False
@@ -325,13 +370,18 @@ def split_mail_request(prompt):
                 except ValueError:
                     continue
                 spans.add(match.span())
+        default_match = DEFAULT_NOTICE_PATTERN.search(masked)
+        if default_match and default_match[0] == line[default_match.start():]:
+            # Masked text must not turn a quoted or malformed address into a bare request.
+            use_default = True
+            spans.add(default_match.span())
         if spans:
             for start, end in sorted(spans, reverse=True):
                 line = line[:start] + line[end:]
             line = line.strip(" \t，,；;")
             line = re.sub(r"[，,；;](?=[。.!！?？]$)", "", line)
             question[-1] = line if line.strip("。.!！?？") else ""
-    return recipients, "\n".join(question).strip()
+    return recipients, use_default, "\n".join(question).strip()
 
 
 def turn_key(event):
@@ -350,7 +400,7 @@ def ensure_turn_tables(db):
     )
 
 
-def record_turn_question(key, question, recipient):
+def record_turn_question(key, question, recipient, *, use_default=False):
     if not (question or recipient):
         return
     # Keep in-progress questions encrypted so a later steering message can request a notice.
@@ -366,8 +416,9 @@ def record_turn_question(key, question, recipient):
         if recipient:
             db.execute(
                 "INSERT INTO notices VALUES (?, ?, unixepoch()) ON CONFLICT(turn_key) "
-                "DO UPDATE SET recipient=excluded.recipient, recorded=excluded.recorded WHERE notices.recipient IS NOT NULL",
-                (key, recipient),
+                "DO UPDATE SET recipient=excluded.recipient, recorded=excluded.recorded "
+                "WHERE notices.recipient IS NOT NULL AND NOT ?",
+                (key, recipient, use_default),
             )
 
 
@@ -518,19 +569,41 @@ def run_prompt_hook():
     prompt = event.get("prompt")
     result = {}
     if event.get("hook_event_name") == "UserPromptSubmit" and key and isinstance(prompt, str) and not event.get("agent_id"):
-        recipients, question = split_mail_request(prompt)
+        edit_default = EDIT_DEFAULT_NOTICE.fullmatch(prompt.strip()) is not None
+        recipients, use_default, question = split_mail_request(prompt)
         configured = SETTINGS.is_file()
         recipient = next(iter(recipients)) if len(recipients) == 1 else None
-        if configured:
-            record_turn_question(key, question, recipient)
+        use_default = use_default and not recipients
+        feedback = None
+        if edit_default or use_default:
+            try:
+                selected = get_default_recipient(edit=edit_default)
+            except subprocess.TimeoutExpired:
+                feedback = "默认收件邮箱设置超时。请重新输入指令。"
+            except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+                feedback = "默认收件邮箱读取或保存失败。请重新输入指令。"
+            else:
+                if edit_default:
+                    feedback = "默认收件邮箱已保存。" if selected else "已取消修改默认收件邮箱。"
+                elif selected:
+                    recipient = selected
+                else:
+                    feedback = "已取消设置默认收件邮箱，本次请求未登记。"
+        if configured and not edit_default:
+            record_turn_question(key, question, recipient, use_default=use_default)
         if len(recipients) > 1:
             result["systemMessage"] = "本轮邮件通知检测到多个收件地址。请用一条指令指定一个地址。"
         elif recipient and not configured:
             result["systemMessage"] = "检测到完成邮件通知请求。请先在本机运行 codex_qq_mail.py setup 或 codex_qq_inbox.py setup。"
-        elif recipient:
+        elif recipient or feedback:
+            if feedback:
+                result["systemMessage"] = feedback
             result["hookSpecificOutput"] = {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": "本轮的一次性完成邮件通知已登记。按原任务继续，结束时由 Stop Hook 尝试投递，勿手动重复发信。",
+                "additionalContext": (
+                    f"{feedback} 按原任务继续。" if feedback else
+                    "本轮的一次性完成邮件通知已登记。按原任务继续，结束时由 Stop Hook 尝试投递，勿手动重复发信。"
+                ),
             }
     print(json.dumps(result))
 

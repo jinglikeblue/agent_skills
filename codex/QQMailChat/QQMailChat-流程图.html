@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QQMailChat UML 活动图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      color: #152d3c;
+      background: #f1f5f7;
+      --line: #d6e1e7;
+      --connector: #77919e;
+      --subtle: #4b6370;
+      --link: #125f79;
+      --teal: #16594b;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { padding: 18px clamp(10px, 1.4vw, 24px) 24px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(24px, 3vw, 34px); line-height: 1.2; }
+    h2 { font-size: 20px; }
+    h3 { font-size: 16px; }
+    a { color: var(--link); text-underline-offset: 3px; }
+    a:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+    code { overflow-wrap: anywhere; font-size: 0.96em; }
+    [id] { scroll-margin-top: 12px; }
+    :target { outline: 2px solid #2083a0; outline-offset: 2px; }
+
+    .page-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px 24px;
+      padding: 4px 2px 14px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 14px;
+    }
+    nav { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 14px; }
+    .section-title { margin: 0 0 9px 2px; }
+
+    .mail-flow, .hook-flow {
+      display: grid;
+      grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.42fr) minmax(0, 0.92fr);
+      gap: 12px;
+    }
+
+    .phase {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+    }
+    .phase > h3 {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+      margin-bottom: 10px;
+    }
+    .phase > h3 span {
+      color: var(--subtle);
+      font: 12px/1.3 Consolas, monospace;
+      text-align: right;
+    }
+    .flow { display: grid; gap: 0; }
+    .node, .branch {
+      min-width: 0;
+      padding: 7px 9px;
+      border: 1px solid #c3d4de;
+      border-radius: 7px;
+      background: #f6f9fb;
+      font-size: 14px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .node strong, .branch strong { display: block; font-weight: 700; }
+    .node p, .branch p { margin-top: 3px; font-size: 13px; color: var(--subtle); }
+    .node.decision { background: #fff8e8; border-color: #e4cd98; }
+    .node.outcome, .branch.outcome { background: #eaf7f1; border-color: #b5d8c9; color: var(--teal); }
+    .branch.error { background: #fff2ee; border-color: #e4bdb2; }
+    .branch.wait { background: #fff8e8; border-color: #e4cd98; }
+
+    /* UML initial, decision, and final markers identify the type of each activity node. */
+    .node.initial > strong::before, .node.decision > strong::before, .final::before {
+      content: "";
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      margin-inline: 2px 8px;
+      vertical-align: 1px;
+      background: currentColor;
+    }
+    .node.initial > strong::before, .final::before { border-radius: 50%; }
+    .node.decision > strong::before { background: #9c631e; transform: rotate(45deg); }
+    .final::before { border: 2px solid #fff; outline: 1px solid currentColor; }
+
+    /* Short connectors and fork lines stay attached as the Chinese labels wrap. */
+    .arrow {
+      position: relative;
+      display: grid;
+      min-height: 15px;
+      align-items: center;
+      justify-items: start;
+      padding-left: calc(50% + 10px);
+      color: var(--subtle);
+      font-size: 12px;
+    }
+    .arrow::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 4px calc(50% - 1px);
+      border-left: 1px solid var(--connector);
+    }
+    .arrow::after {
+      content: "";
+      position: absolute;
+      bottom: 3px;
+      left: calc(50% - 3px);
+      width: 4px;
+      height: 4px;
+      border: solid var(--connector);
+      border-width: 0 1px 1px 0;
+      transform: rotate(45deg);
+    }
+    .arrow.label { min-height: 21px; }
+    .fork, .joined {
+      display: grid;
+      grid-template-columns: repeat(var(--branches, 2), minmax(0, 1fr));
+      gap: 6px;
+    }
+    .fork.three { --branches: 3; }
+    .fork > .branch { position: relative; }
+    .fork > .branch::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: -10px;
+      height: 9px;
+      border-left: 1px solid var(--connector);
+    }
+    .fork::before {
+      content: "";
+      grid-column: 1 / -1;
+      height: 3px;
+      margin-inline: calc(25% - 1.5px);
+      border: solid var(--connector);
+      border-width: 1px 0 0;
+    }
+    .fork.three::before { margin-inline: calc(100% / 6 - 2px); }
+    .join {
+      height: 8px;
+      margin-inline: calc(25% - 1.5px);
+      border: solid var(--connector);
+      border-width: 0 1px 1px;
+    }
+    .join.three {
+      position: relative;
+      margin-inline: calc(100% / 6 - 2px);
+    }
+    .join.three::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 50%;
+      border-left: 1px solid var(--connector);
+    }
+
+    .exit {
+      display: block;
+      margin-top: 4px;
+      color: #59472e;
+      font-size: 13px;
+    }
+    .note {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+      font-size: 13px;
+      line-height: 1.55;
+      color: var(--subtle);
+      overflow-wrap: anywhere;
+    }
+    .note summary { color: var(--link); cursor: pointer; }
+    .note p { margin: 4px 0 0; }
+    .notification { margin-top: 18px; }
+    .hook-flow { grid-template-columns: minmax(0, 1.2fr) repeat(2, minmax(0, 1fr)); }
+    .hook-flow .phase { border-top: 3px solid #95c4b9; }
+
+    @media (max-width: 1040px) {
+      .mail-flow { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr); }
+      .hook-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #delivery, #prompt-hook { grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px) {
+      .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 500px) {
+      main { padding-block: 12px 16px; }
+      .phase { padding: 9px; }
+      /* Keep three-way routes legible on narrow phones. */
+      .fork.three { grid-template-columns: minmax(0, 1fr); }
+      .fork.three::before, .fork.three > .branch::before, .join.three { display: none; }
+    }
+    @media print {
+      :root { background: #fff; }
+      main { padding: 0; }
+      nav { display: none; }
+      .phase { break-inside: avoid; }
+      .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <h1>QQMailChat UML 活动图</h1>
+      <nav aria-label="流程导航">
+        <a href="#email">邮件发起与续聊</a>
+        <a href="#notice">Codex 完成通知</a>
+      </nav>
+    </header>
+
+    <!-- The links between stages identify where each branch continues. -->
+    <section id="email" aria-labelledby="email-title">
+      <h2 id="email-title" class="section-title">邮件发起与续聊</h2>
+      <div class="mail-flow">
+        <section id="intake" class="phase" aria-labelledby="intake-title">
+          <h3 id="intake-title">收信与校验 <span>QQ IMAP</span></h3>
+          <div class="flow">
+            <div class="node initial">
+              <strong>监听 QQ 收件箱</strong>
+              <p>每轮先尝试投递待发回信，再读取收件箱。首次运行或 UIDVALIDITY 变化时建立收件起点，之后只检查起点后的新邮件。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision">
+              <strong>是指令邮件或可关联的人工回复？</strong>
+              <span class="exit">否 → 跳过自动邮件、无关邮件、邮件头无效或无法关联的回复。</span>
+            </div>
+            <div class="arrow label">是</div>
+            <div class="node decision">
+              <strong>发件人通过身份校验？</strong>
+              <span class="exit">否 → 记录并跳过。</span>
+            </div>
+            <div class="arrow label">是</div>
+            <div class="node decision">
+              <strong>该邮箱下的 Message-ID 已登记过？</strong>
+              <span class="exit">是 → 跳过重复提交，含上次提交结果未知的邮件。</span>
+            </div>
+            <div class="arrow label">否</div>
+            <div class="node outcome"><strong><a href="#routing">定位会话与执行 →</a></strong></div>
+          </div>
+          <details class="note" open>
+            <summary>身份校验规则</summary>
+            <p>主动指令要求发件人在允许列表内，直接回复要求来自原通知或原回信的收件地址。QQ 自发自收检查「已发送」副本。外部地址采用 QQ 的 DMARC 校验，已关联的回复或显式启用了 SPF 的允许地址也可通过 QQ 的 SPF 校验。</p>
+          </details>
+          <p class="note">处理或跳过邮件后保存 UID。暂时故障会保留收件进度，约 30 秒后进入下一轮。</p>
+        </section>
+
+        <section id="routing" class="phase" aria-labelledby="routing-title">
+          <h3 id="routing-title">定位会话与执行 <span>Codex App Server</span></h3>
+          <div class="flow">
+            <div class="node decision">
+              <strong>如何定位会话？</strong>
+              <p>主动指令可用 <code>[AI会话]</code> 或 <code>[AIChat]</code>，后者忽略大小写。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="fork three">
+              <div class="branch">
+                <strong>按名称</strong>
+                <p><code>[工作目录名][会话名]</code> 或 <code>[会话名]</code>，后者默认 <code>Global</code>。先按工作目录查找现有会话，再按旧项目名回退。可恢复归档会话，找不到时可新建。</p>
+              </div>
+              <div class="branch">
+                <strong>按 ID</strong>
+                <p>单段为完整 <code>[会话ID]</code> 时，直接查找已有会话，包括未归入项目的会话。</p>
+              </div>
+              <div class="branch">
+                <strong>直接回复</strong>
+                <p>依次查 <code>In-Reply-To</code>、<code>References</code> 和原主题，仅提交新增正文。</p>
+              </div>
+            </div>
+            <div class="join three" aria-hidden="true"></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node">
+              <strong>登记回信信息，再提交给 Codex</strong>
+              <p>登记已验证的发件人、邮件回复头和加密后的本轮问题。来信中的无地址通知请求使用自动回信。默认地址的修改在本机 Codex 中处理。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision"><strong>提交如何处理？</strong></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="fork">
+              <div class="branch">
+                <strong>立即开始</strong>
+                <p>主动指令且目标会话空闲 → <code>turn/start</code>。</p>
+              </div>
+              <div class="branch">
+                <strong>加入会话队列</strong>
+                <p>直接回复，或按名称／ID 找到的会话正在运行、写入权被占用或开始时遇忙 → <code>thread/queue/add</code>。</p>
+              </div>
+            </div>
+            <div class="join" aria-hidden="true"></div>
+            <div class="arrow label">成功提交或入队</div>
+            <div class="node outcome">
+              <strong>该轮完成 → <a href="#completion-reply">生成完成回信</a></strong>
+              <p>按本轮用户消息追踪完成记录。尚未完成时，保留记录并在后续轮询中检查。</p>
+            </div>
+          </div>
+          <details class="note" open>
+            <summary>定位或提交失败时</summary>
+            <p>已验证的主动指令确定无法提交 → <a href="#failure-reply">登记失败回执</a>。无法关联或无法路由的直接回复 → 跳过。连接等暂时故障 → 下一次轮询重试。</p>
+          </details>
+        </section>
+
+        <section id="delivery" class="phase" aria-labelledby="delivery-title">
+          <h3 id="delivery-title">回信与投递 <span>QQ SMTP</span></h3>
+          <div class="flow">
+            <div class="joined">
+              <div id="completion-reply" class="branch outcome">
+                <strong>完成回信</strong>
+                <p>附上本轮问题和最终答复。</p>
+              </div>
+              <div id="failure-reply" class="branch error">
+                <strong>失败回执</strong>
+                <p>说明拒绝原因，如 ID 无效、目标重名或目录不可用。</p>
+              </div>
+            </div>
+            <div class="join" aria-hidden="true"></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node">
+              <strong>给原发件人发送线程回信</strong>
+              <p>沿用 <code>Re:</code> 主题和邮件回复头。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision"><strong>SMTP 投递结果如何？</strong></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="fork three">
+              <div class="branch outcome">
+                <strong class="final">已接收</strong>
+                <p>标记已发送。</p>
+              </div>
+              <div class="branch wait">
+                <strong>明确失败</strong>
+                <p>保留待发送记录，下轮重试。</p>
+              </div>
+              <div class="branch error">
+                <strong class="final">结果未知</strong>
+                <p>暂停自动重发。</p>
+              </div>
+            </div>
+          </div>
+          <p class="note"><a href="#intake">直接回复完成回信 → 继续原会话</a></p>
+        </section>
+      </div>
+    </section>
+
+    <section id="notice" class="notification" aria-labelledby="notice-title">
+      <h2 id="notice-title" class="section-title">本机 Codex 完成通知</h2>
+      <div class="hook-flow">
+        <section id="prompt-hook" class="phase" aria-labelledby="prompt-title">
+          <h3 id="prompt-title">登记本轮收件地址 <span>UserPromptSubmit</span></h3>
+          <div class="flow">
+            <div class="node initial"><strong>本机任务中请求「完成后邮件通知」</strong></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision"><strong>有指定的邮箱地址？</strong></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="fork">
+              <div class="branch">
+                <strong>指定一个地址</strong>
+                <p>本轮使用该地址，优先于默认地址和会话订阅。填了多个地址时提示只选一个。</p>
+              </div>
+              <div class="branch">
+                <strong>省略地址</strong>
+                <p>复用已保存的默认邮箱。首次用 Windows 弹窗设置，保存后供本轮和以后使用。取消、关闭或超时则本次请求未登记。</p>
+              </div>
+            </div>
+            <div class="join" aria-hidden="true"></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision">
+              <strong>已有收件地址且已配置 SMTP？</strong>
+              <span class="exit">缺少 SMTP 配置 → 提示设置发信服务。</span>
+            </div>
+            <div class="arrow label">是</div>
+            <div class="node outcome"><strong><a href="#stop-hook">登记本轮通知，等待任务结束 →</a></strong></div>
+          </div>
+          <p class="note">单独输入「修改默认接收通知邮件地址」可打开预填当前邮箱的 Windows 输入框。保存后供后续省略地址的请求使用。</p>
+        </section>
+
+        <section id="stop-hook" class="phase" aria-labelledby="stop-title">
+          <h3 id="stop-title">任务结束时选定收件人 <span>Stop</span></h3>
+          <div class="flow">
+            <div class="node initial">
+              <strong>任务结束，领取本轮通知记录</strong>
+              <p>优先使用本轮地址。本轮没有通知记录时读取该会话的长期订阅地址。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node decision">
+              <strong>找到收件地址？</strong>
+              <span class="exit">否 → 结束，包括重复触发已经领取的通知。</span>
+            </div>
+            <div class="arrow label">是</div>
+            <div class="node decision">
+              <strong>同一轮已经为该地址登记邮件回信？</strong>
+              <span class="exit">是 → 由监听程序<a href="#completion-reply">发送原线程完成回信</a>。</span>
+            </div>
+            <div class="arrow label">否</div>
+            <div class="node outcome"><strong><a href="#notice-delivery">生成独立完成通知 →</a></strong></div>
+          </div>
+        </section>
+
+        <section id="notice-delivery" class="phase" aria-labelledby="notice-delivery-title">
+          <h3 id="notice-delivery-title">发送完成通知 <span>QQ SMTP</span></h3>
+          <div class="flow">
+            <div class="node">
+              <strong>组装本轮问题和最终答复</strong>
+              <p>主题通常为 <code>[完成通知][工作目录名][会话名][续聊码 …]</code>。工作目录名优先用唯一匹配的侧栏显示名，其次用文件夹名。</p>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node outcome">
+              <strong class="final">Stop Hook 尝试发送一次</strong>
+              <p>SMTP 接收后记录续聊关联，供收件人直接回复。</p>
+            </div>
+          </div>
+          <p class="note"><a href="#intake">直接回复完成通知 → 继续原会话</a></p>
+        </section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

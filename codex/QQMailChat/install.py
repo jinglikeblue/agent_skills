@@ -15,6 +15,7 @@ SCRIPTS = (
     "codex_qq_inbox.py",
     "qq_mail_credentials.py",
     "qq-mail-credential-window.ps1",
+    "qq-mail-recipient-window.ps1",
 )
 SKILL = Path("skills/qq-mail-notify/SKILL.md")
 
@@ -48,7 +49,7 @@ def merge_hooks(document, script):
         raise ValueError("hooks.json 必须包含有效的 hooks 对象。")
     hooks = document["hooks"]
     path = re.escape(script.as_posix().casefold())
-    for event, action, timeout in (("UserPromptSubmit", "prompt-hook", 5), ("Stop", "hook", 35)):
+    for event, action, timeout in (("UserPromptSubmit", "prompt-hook", 120), ("Stop", "hook", 35)):
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
             raise ValueError(f"hooks.json 中的 {event} 必须是数组。")
@@ -72,6 +73,10 @@ def merge_hooks(document, script):
             # Recognize earlier installations and keep the local handler's other settings.
             handler, key = existing
             handler[key] = command
+            # The prompt hook now waits for first-time input when no recipient is given.
+            previous_timeout = handler.get("timeout")
+            if event == "UserPromptSubmit" and isinstance(previous_timeout, int) and previous_timeout < timeout:
+                handler["timeout"] = timeout
         else:
             handler = {"type": "command", "command": command, "timeout": timeout}
             if event == "Stop":

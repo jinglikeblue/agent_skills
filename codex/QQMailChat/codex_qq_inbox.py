@@ -63,7 +63,11 @@ class RpcError(RuntimeError):
 
 
 class BusyThread(RuntimeError):
-    """The destination chat already has an active turn."""
+    """The resolved chat already has a turn or writer."""
+
+    def __init__(self, thread_id):
+        super().__init__("The destination chat is busy.")
+        self.thread_id = thread_id
 
 
 class AppServer:
@@ -455,13 +459,27 @@ def new_project_folder(root, name):
     return path
 
 
+def is_busy_rpc(error):
+    detail = error.detail.casefold()
+    return any(hint in detail for hint in (
+        "already has an active writer", "active or pending turn", "thread is busy",
+    ))
+
+
 def resume_chat(server, thread):
+    # Keep the matched ID available for queueing even when the server refuses to resume it.
+    thread_id = thread["id"]
     if thread.get("status", {}).get("type") == "active":
-        raise BusyThread
-    thread = server.call("thread/resume", {"threadId": thread["id"], "excludeTurns": True})["thread"]
+        raise BusyThread(thread_id)
+    try:
+        thread = server.call("thread/resume", {"threadId": thread_id, "excludeTurns": True})["thread"]
+    except RpcError as error:
+        if is_busy_rpc(error):
+            raise BusyThread(thread_id) from error
+        raise
     if thread.get("status", {}).get("type") == "active":
-        raise BusyThread
-    return thread["id"]
+        raise BusyThread(thread_id)
+    return thread_id
 
 
 def named_chats(server, title, *, archived=False):
@@ -563,9 +581,8 @@ def submission_key(mailbox, message_id):
     return hashlib.sha256(f"{mailbox}\0{message_id}".encode()).hexdigest()
 
 
-def record_completion_reply(db, mailbox, command, thread_id, client_id):
+def record_completion_reply(db, mailbox, command, thread_id, client_id, question):
     # Save only the authenticated sender, mail headers, and the encrypted question.
-    _, question = mail.split_mail_request(command.text)
     protected = mail.windows_protect(question.encode("utf-8"), encrypt=True) if question else None
     db.execute(
         "INSERT INTO reply_notifications (client_id, mailbox, thread_id, recipient, subject, "
@@ -587,32 +604,40 @@ def submit_command(db, config, command, uid):
         queued = command.is_reply
         try:
             thread_id = resolve_chat(server, Path(config["project_root"]), command)
-        except (BusyThread, RpcError) as error:
-            occupied = isinstance(error, BusyThread) or (
-                error.method == "thread/resume" and "already has an active writer" in error.detail.casefold()
-            )
-            if not command.thread_id or not occupied:
-                raise
-            thread_id = command.thread_id
+        except BusyThread as error:
+            thread_id = error.thread_id
             queued = True
         client_id = str(uuid5(NAMESPACE_URL, key))
+        recipients, use_default, question = mail.split_mail_request(command.text)
+        text = command.text
+        if use_default and not recipients:
+            # Incoming commands already receive a reply and must not open a local settings window.
+            text = question or "请在本轮结束时回复这封邮件。"
+        elif mail.EDIT_DEFAULT_NOTICE.fullmatch(text.strip()):
+            text = "请回复发件人，说明默认收件邮箱需要在本机 Codex 中修改。"
         params = {
             "threadId": thread_id, "clientUserMessageId": client_id,
-            "input": [{"type": "text", "text": command.text}],
+            "input": [{"type": "text", "text": text}],
         }
         # Record the reply envelope before submitting. A fast turn can finish before the RPC returns.
         with db:
             db.execute("INSERT INTO submissions VALUES (?, ?, NULL, ?)", (key, thread_id, "submitting"))
-            record_completion_reply(db, config["mailbox"], command, thread_id, client_id)
+            record_completion_reply(db, config["mailbox"], command, thread_id, client_id, question)
         try:
+            if not queued:
+                try:
+                    # Apply the workspace sandbox even when an existing chat used a broader policy.
+                    started = server.call("turn/start", {
+                        **params, "approvalPolicy": "never", "sandboxPolicy": {"type": "workspaceWrite"},
+                    })
+                except RpcError as error:
+                    # Another client can start a turn between resume and start.
+                    if not is_busy_rpc(error):
+                        raise
+                    queued = True
             if queued:
                 # The current writer can dispatch this after the active turn.
                 server.call("thread/queue/add", params)
-            else:
-                # Apply the workspace sandbox even when an existing chat used a broader policy.
-                started = server.call("turn/start", {
-                    **params, "approvalPolicy": "never", "sandboxPolicy": {"type": "workspaceWrite"},
-                })
         except RpcError:
             with db:
                 db.execute("DELETE FROM submissions WHERE message_key=?", (key,))
@@ -638,9 +663,7 @@ def rejection_reason(error):
         return str(error)
     if error.code == -32601:
         return "当前 Codex 版本不支持所需的会话操作，请更新 Codex 后重试。"
-    if error.code not in {-32600, -32602} or any(hint in error.detail.casefold() for hint in (
-        "already has an active writer", "active or pending turn", "thread is busy",
-    )):
+    if error.code not in {-32600, -32602} or is_busy_rpc(error):
         return None  # Busy chats and transport or server failures can still recover.
     # The raw RPC error may include local paths or account details.
     return {
