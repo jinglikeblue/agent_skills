@@ -29,6 +29,7 @@ CODEX_PROFILE = SETTINGS.parent.parent
 ROUTES = SETTINGS.with_name("routes")
 TURN_NOTICES = SETTINGS.with_name("turn-notices.sqlite3")
 REPLY_ROUTES = SETTINGS.with_name("reply-routes.sqlite3")
+INBOX_STATE = SETTINGS.with_name("inbox-state.sqlite3")
 UUID_TEXT = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 ROLLOUT_NAME = re.compile(rf"rollout-.+?-({UUID_TEXT})(?:_{UUID_TEXT})?\.jsonl", re.IGNORECASE)
 REPLY_PREFIX = re.compile(r"^(?:(?:re|回复)\s*[:：]\s*)+", re.IGNORECASE)
@@ -57,6 +58,10 @@ EXAMPLE_LINE = re.compile(r"^(?:例如|比如|示例|样例|举例|引用|参考
 
 class DataBlob(ctypes.Structure):
     _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+class ReplyDeliveryUncertain(OSError):
+    """The SMTP connection ended without establishing whether DATA was accepted."""
 
 
 def windows_protect(data, *, encrypt):
@@ -227,7 +232,7 @@ def _unique_reply_chat(rows):
     return rows[0][0] if rows else None
 
 
-def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None):
+def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None, reply=None):
     settings = json.loads(SETTINGS.read_text(encoding="utf-8-sig"))
     sender = settings["sender"]
     recipient = recipient or settings["recipient"]
@@ -236,23 +241,49 @@ def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None
     message["From"] = sender
     message["To"] = recipient
     message["Date"] = formatdate(localtime=True)
-    token = secrets.token_hex(12) if thread_id and not test else None
-    message_id = make_msgid(idstring=token, domain=sender.rsplit("@", 1)[1])
-    message["Message-ID"] = message_id
-    full_subject = "Codex QQ 邮箱测试" if test else subject
-    if token:
-        # Some enterprise clients strip reply headers. The subject still carries a unique route.
-        full_subject += f"[续聊码 {token}]"
-    message["Subject"] = full_subject
+    domain = sender.rsplit("@", 1)[1]
+    base_subject = "Codex QQ 邮箱测试" if test else subject
+    if reply:
+        parent_id, references, client_id = reply
+        message["Message-ID"] = f"<codex-qqmailchat.{client_id}@{domain}>"
+        message["In-Reply-To"] = parent_id
+        chain = [ref for ref in references if ref != parent_id]
+        message["References"] = " ".join([*chain[-49:], parent_id])
+        message["Auto-Submitted"] = "auto-replied"
+        base_subject = REPLY_PREFIX.sub("", base_subject).strip() or "[完成通知]"
+        message["Subject"] = f"Re: {base_subject}"
+    else:
+        token = secrets.token_hex(12) if thread_id and not test else None
+        message["Message-ID"] = make_msgid(idstring=token, domain=domain)
+        if token:
+            # Clients that strip reply headers can still route using the subject.
+            base_subject += f"[续聊码 {token}]"
+        message["Subject"] = base_subject
     message.set_content("QQ 邮箱通知配置测试。" if test else body)
 
-    with smtplib.SMTP_SSL(
-        "smtp.qq.com", 465, timeout=10, context=ssl.create_default_context()
-    ) as smtp:
-        smtp.login(sender, code.decode("ascii"))
-        smtp.send_message(message)
-        if token:
-            remember_reply_route(message_id, sender, recipient, full_subject, thread_id)
+    accepted = False
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.qq.com", 465, timeout=10, context=ssl.create_default_context()
+        ) as smtp:
+            smtp.login(sender, code.decode("ascii"))
+            if reply and thread_id:
+                remember_reply_route(str(message["Message-ID"]), sender, recipient, base_subject, thread_id)
+            try:
+                smtp.send_message(message)
+            except (smtplib.SMTPResponseException, smtplib.SMTPRecipientsRefused, smtplib.SMTPNotSupportedError):
+                raise  # The server refused delivery, so retrying cannot duplicate it.
+            except OSError as error:
+                if reply:
+                    raise ReplyDeliveryUncertain from error
+                raise
+            accepted = True
+            if thread_id and not test and not reply:
+                remember_reply_route(str(message["Message-ID"]), sender, recipient, base_subject, thread_id)
+    except OSError:
+        if not accepted:
+            raise
+        # Failure to send QUIT does not undo the server's acceptance of DATA.
 
 
 def split_mail_request(prompt):
@@ -361,14 +392,61 @@ def take_turn_notice(key, route=None):
     return recipient, question
 
 
+def latest_state_db():
+    databases = (path for path in CODEX_PROFILE.glob("state_*.sqlite") if path.stem.removeprefix("state_").isdigit())
+    return max(databases, key=lambda path: int(path.stem.removeprefix("state_")), default=None)
+
+
+def reply_turn_events(transcript, *, turn_id=None):
+    # A queued message retains its App Server client ID in the persisted UserMessage item.
+    turn_bytes = turn_id.encode("utf-8") if turn_id else None
+    try:
+        with Path(transcript).open("rb") as stream:
+            for line in stream:
+                if turn_bytes and turn_bytes not in line:
+                    continue
+                if b'"event_msg"' not in line or not (b'"client_id"' in line or b'"task_complete"' in line):
+                    continue
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue  # A live transcript can end in a partially written line.
+                if record.get("type") == "event_msg":
+                    event = record["payload"]
+                    if not turn_id or event.get("turn_id") == turn_id:
+                        yield event
+    except FileNotFoundError:
+        return
+
+
+def user_item(event):
+    item = event.get("item", {}) if event.get("type") == "item_completed" else {}
+    return item if item.get("type") == "UserMessage" else {}
+
+
+def reply_covers_recipient(event, thread_id, recipient):
+    if not (thread_id and isinstance(event.get("turn_id"), str) and INBOX_STATE.is_file()):
+        return False
+    with closing(sqlite3.connect(INBOX_STATE.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='reply_notifications'").fetchone():
+            return False  # The listener may still be using a database from the previous version.
+        candidates = {row[0] for row in db.execute(
+            "SELECT client_id FROM reply_notifications WHERE thread_id=? AND recipient=?", (thread_id, recipient.casefold()),
+        )}
+    if not candidates:
+        return False
+    return any(user_item(item).get("client_id") in candidates for item in reply_turn_events(
+        event["transcript_path"], turn_id=event["turn_id"],
+    ))
+
+
 def project_and_chat(event):
     # Query only the owning chat and its project in Codex's current local index.
     defaults = ("未归属项目", "未命名会话")
     thread_id = hook_chat_id(event) or event.get("session_id")
     if not isinstance(thread_id, str) or not re.fullmatch(UUID_TEXT, thread_id, re.IGNORECASE):
         return defaults
-    databases = (path for path in CODEX_PROFILE.glob("state_*.sqlite") if path.stem.removeprefix("state_").isdigit())
-    latest = max(databases, key=lambda path: int(path.stem.removeprefix("state_")), default=None)
+    latest = latest_state_db()
     if latest is None:
         return defaults
     try:
@@ -388,11 +466,14 @@ def notice_content(event, question):
     project, chat = project_and_chat(event)
     labels = (label.translate(str.maketrans("[]", "［］")) for label in (project, chat))
     subject = "[完成通知]" + "".join(f"[{label}]" for label in labels)
-    conclusion = event.get("last_assistant_message")
+    return subject, notice_body(question, event.get("last_assistant_message"))
+
+
+def notice_body(question, conclusion):
     conclusion = conclusion.strip() if isinstance(conclusion, str) else ""
     question = question or "本轮未记录到任务问题。"
     conclusion = conclusion or "本轮未生成文本结论。"
-    return subject, f"问题\n{question}\n\n结论\n{conclusion}\n"
+    return f"问题\n{question}\n\n结论\n{conclusion}\n"
 
 
 def run_prompt_hook():
@@ -425,7 +506,7 @@ def run_hook():
         thread_id = hook_chat_id(event)
         route = ROUTES / f"{thread_id}.json" if thread_id else None
         recipient, question = take_turn_notice(turn_key(event), route)
-        if recipient:
+        if recipient and not reply_covers_recipient(event, thread_id, recipient):
             subject, body = notice_content(event, question)
             send_notice(test=False, recipient=recipient, subject=subject, body=body, thread_id=thread_id)
     print("{}")
