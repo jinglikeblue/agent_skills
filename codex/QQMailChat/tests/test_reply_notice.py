@@ -160,7 +160,7 @@ class ReplyNotificationTest(unittest.TestCase):
         self.assertEqual((method, params["threadId"]), ("turn/start", THREAD))
         server.wait_turn.assert_called_once_with(THREAD, "test-turn")
         server.pages.assert_not_called()
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reply_notifications").fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT recipient, thread_id FROM reply_notifications").fetchone(), (SENDER, THREAD))
 
     def test_explicit_id_mail_queues_when_target_chat_is_busy(self):
         command, _ = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
@@ -169,7 +169,51 @@ class ReplyNotificationTest(unittest.TestCase):
             server.call.side_effect = [{"thread": {"id": THREAD, "status": {"type": "active"}}}, {}]
             inbox.submit_command(self.db, self.config, command, 1)
         self.assertEqual([request.args[0] for request in server.call.call_args_list], ["thread/read", "thread/queue/add"])
+        self.assertEqual(self.db.execute("SELECT recipient, thread_id FROM reply_notifications").fetchone(), (SENDER, THREAD))
+
+    def test_new_email_chat_replies_on_completion_and_accepts_followup(self):
+        subject = "[AI会话][测试目录][新会话]"
+        command, _ = self.command_email(subject, "请开始。")
+        project = {"id": "tools", "name": "测试目录", "roots": [{"path": self.config["project_root"]}]}
+        with patch.object(inbox, "connect_codex") as connect, contextlib.redirect_stdout(io.StringIO()):
+            server = connect.return_value.__enter__.return_value
+            server.pages.side_effect = [[project], [], []]
+            server.call.side_effect = [{"thread": {"id": THREAD}}, {}, {"turn": {"id": "reply-turn"}}]
+            server.wait_turn.return_value = "completed"
+            inbox.submit_or_record_failure(self.db, self.config, command, 1)
+            inbox.submit_or_record_failure(self.db, self.config, command, 1)
+            connect.assert_called_once()
+        requests = server.call.call_args_list
+        self.assertEqual([request.args[0] for request in requests], ["thread/start", "thread/name/set", "turn/start"])
+        self.record_turn(requests[-1].args[1]["clientUserMessageId"])
+        self.append(type="task_complete", turn_id="reply-turn", last_agent_message="已经完成。")
+        with patch.object(mail.smtplib, "SMTP_SSL") as connection, contextlib.redirect_stdout(io.StringIO()):
+            smtp = connection.return_value.__enter__.return_value
+            inbox.deliver_completed_replies(self.db, MAILBOX)
+            inbox.deliver_completed_replies(self.db, MAILBOX)
+            smtp.send_message.assert_called_once()
+        response = smtp.send_message.call_args.args[0]
+        self.assertEqual(str(response["To"]), SENDER)
+        self.assertEqual(str(response["Subject"]), "Re: " + subject)
+        self.assertEqual(str(response["In-Reply-To"]), PARENT_ID)
+        self.assertIn("已经完成。", response.get_content())
+        followup, _ = inbox.parse_mail(self.raw_email(
+            str(response["Subject"]), "请继续。\n> 已经完成。", in_reply_to=str(response["Message-ID"]),
+            message_id="<followup@example.com>",
+        ), MAILBOX)
+        self.assertEqual((followup.thread_id, followup.is_reply, followup.text), (THREAD, True, "请继续。"))
+
+    def test_rejected_turn_start_only_enqueues_failure_receipt(self):
+        command, _ = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
+        with patch.object(inbox, "connect_codex") as connect, contextlib.redirect_stdout(io.StringIO()):
+            server = connect.return_value.__enter__.return_value
+            server.call.side_effect = [
+                {"thread": {"id": THREAD}}, {"thread": {"id": THREAD}},
+                inbox.RpcError("turn/start", {"code": -32602, "message": "invalid params"}),
+            ]
+            inbox.submit_or_record_failure(self.db, self.config, command, 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reply_notifications").fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT status FROM failed_replies").fetchone(), ("pending",))
 
     def test_explicit_id_does_not_inherit_reply_permissions(self):
         # A reply header on an explicit-ID command cannot bypass its normal sender checks.

@@ -559,6 +559,18 @@ def submission_key(mailbox, message_id):
     return hashlib.sha256(f"{mailbox}\0{message_id}".encode()).hexdigest()
 
 
+def record_completion_reply(db, mailbox, command, thread_id, client_id):
+    # Save only the authenticated sender, mail headers, and the encrypted question.
+    _, question = mail.split_mail_request(command.text)
+    protected = mail.windows_protect(question.encode("utf-8"), encrypt=True) if question else None
+    db.execute(
+        "INSERT INTO reply_notifications (client_id, mailbox, thread_id, recipient, subject, "
+        "parent_id, refs, question) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (client_id, mailbox, thread_id, command.sender, command.subject,
+         command.message_id, json.dumps(command.references), protected),
+    )
+
+
 def submit_command(db, config, command, uid):
     key = submission_key(config["mailbox"], command.message_id)
     previous = db.execute("SELECT status FROM submissions WHERE message_key=?", (key,)).fetchone()
@@ -584,18 +596,10 @@ def submit_command(db, config, command, uid):
             "threadId": thread_id, "clientUserMessageId": client_id,
             "input": [{"type": "text", "text": command.text}],
         }
-        # Persist the claim before the write RPC. A lost connection may hide a successful submit.
+        # Record the reply envelope before submitting. A fast turn can finish before the RPC returns.
         with db:
             db.execute("INSERT INTO submissions VALUES (?, ?, NULL, ?)", (key, thread_id, "submitting"))
-            if command.is_reply:
-                _, question = mail.split_mail_request(command.text)
-                protected = mail.windows_protect(question.encode("utf-8"), encrypt=True) if question else None
-                db.execute(
-                    "INSERT INTO reply_notifications (client_id, mailbox, thread_id, recipient, subject, "
-                    "parent_id, refs, question) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (client_id, config["mailbox"], thread_id, command.sender, command.subject,
-                     command.message_id, json.dumps(command.references), protected),
-                )
+            record_completion_reply(db, config["mailbox"], command, thread_id, client_id)
         try:
             if queued:
                 # The current writer can dispatch this after the active turn.
@@ -608,8 +612,7 @@ def submit_command(db, config, command, uid):
         except RpcError:
             with db:
                 db.execute("DELETE FROM submissions WHERE message_key=?", (key,))
-                if command.is_reply:
-                    db.execute("DELETE FROM reply_notifications WHERE client_id=?", (client_id,))
+                db.execute("DELETE FROM reply_notifications WHERE client_id=?", (client_id,))
             raise
         if queued:
             with db:
