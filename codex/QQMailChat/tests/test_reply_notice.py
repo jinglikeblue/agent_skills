@@ -47,16 +47,19 @@ class ReplyNotificationTest(unittest.TestCase):
         self.enterContext(patch.object(mail, "windows_protect", side_effect=lambda data, **_: data))
         self.config = {"mailbox": MAILBOX, "project_root": str(root)}
 
-    def command_email(self, subject, body, *, in_reply_to=None):
+    def raw_email(self, subject, body, *, in_reply_to=None, message_id=PARENT_ID, sender=SENDER):
         message = EmailMessage()
-        message["From"] = SENDER
+        message["From"] = sender
         message["To"] = MAILBOX
         message["Subject"] = subject
-        message["Message-ID"] = PARENT_ID
+        message["Message-ID"] = message_id
         if in_reply_to:
             message["In-Reply-To"] = in_reply_to
         message.set_content(body)
-        return inbox.parse_mail(message.as_bytes(), MAILBOX)
+        return message.as_bytes()
+
+    def command_email(self, subject, body, *, in_reply_to=None):
+        return inbox.parse_mail(self.raw_email(subject, body, in_reply_to=in_reply_to), MAILBOX)
 
     def command(self):
         command, _ = self.command_email("回复：" + SUBJECT, "请继续。\n> 上一轮正文", in_reply_to=ROOT_ID)
@@ -187,8 +190,10 @@ class ReplyNotificationTest(unittest.TestCase):
         command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
         self.assertEqual((command.project, command.chat, command.thread_id), ("测试项目", "测试会话", None))
         for bad_id in ("", "01234567", "not-an-id"):
-            with self.subTest(bad_id=bad_id), self.assertRaisesRegex(inbox.RejectedMail, "完整的本地会话 ID"):
-                self.command_email(f"[AI会话][{bad_id}]", "请继续。")
+            with self.subTest(bad_id=bad_id):
+                invalid, _ = self.command_email(f"[AI会话][{bad_id}]", "请继续。")
+                self.assertIn("完整的本地会话 ID", invalid.rejection_reason)
+                self.assertIsNone(invalid.thread_id)
 
     def test_missing_id_is_rejected_without_attempting_to_resume_or_create(self):
         command, _ = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
@@ -198,6 +203,70 @@ class ReplyNotificationTest(unittest.TestCase):
             inbox.resolve_chat(server, Path(self.config["project_root"]), command)
         server.call.assert_called_once_with("thread/read", {"threadId": THREAD, "includeTurns": False})
         server.pages.assert_not_called()
+
+    def test_failed_commands_reply_in_original_threads_and_advance_the_inbox(self):
+        # The fifth UID repeats the first Message-ID. The fourth sender is unauthorized.
+        by_id = f"[AI会话][{THREAD}]"
+        by_name = "[AI会话][测试项目][测试会话]"
+        named_id, malformed_id = "<named@example.com>", "<malformed@example.com>"
+        messages = {
+            1: self.raw_email(by_id, "测试找不到的会话。", in_reply_to=ROOT_ID),
+            2: self.raw_email(by_name, "测试重名的会话。", message_id=named_id),
+            3: self.raw_email("[AI会话][123]", "测试无效的会话 ID。", message_id=malformed_id),
+            4: self.raw_email(by_id, "未授权。", sender="unknown@example.com", message_id="<unknown@example.com>"),
+        }
+        messages[5] = messages[1]
+        box = Mock()
+        box.response.return_value = ("UIDVALIDITY", [b"42"])
+        box.uid.return_value = ("OK", [b"1 2 3 4 5"])
+        inbox.checkpoint(self.db, MAILBOX, 42, 0)
+        config = {**self.config, "senders": [SENDER]}
+        with (patch.object(inbox, "connect_codex") as connect,
+              patch.object(inbox, "inbox_connection", return_value=contextlib.nullcontext(box)),
+              patch.object(inbox, "read_message", side_effect=lambda _, uid: messages[uid]),
+              patch.object(inbox, "qq_dmarc_passes", return_value=True),
+              contextlib.redirect_stdout(io.StringIO())):
+            server = connect.return_value.__enter__.return_value
+            server.call.side_effect = inbox.RpcError("thread/read", {"code": -32600, "message": f"thread not loaded: {THREAD}"})
+            server.pages.side_effect = [
+                [{"id": "project", "name": "测试项目"}],
+                [{"id": "first", "name": "测试会话"}, {"id": "second", "name": "测试会话"}],
+            ]
+            inbox.poll(self.db, config)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(self.db.execute("SELECT last_uid FROM checkpoint").fetchone(), (5,))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM failed_replies").fetchone(), (3,))
+
+        with patch.object(mail.smtplib, "SMTP_SSL") as connection, contextlib.redirect_stdout(io.StringIO()):
+            smtp = connection.return_value.__enter__.return_value
+            smtp.send_message.side_effect = [mail.smtplib.SMTPDataError(451, b"Try again"), {}, {}, {}]
+            for _ in range(3):
+                inbox.deliver_failed_replies(self.db, MAILBOX)
+            attempts = [attempt.args[0] for attempt in smtp.send_message.call_args_list]
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(attempts[0]["Message-ID"], attempts[3]["Message-ID"])
+        replies = {str(message["In-Reply-To"]): message for message in attempts}
+        self.assertEqual(set(replies), {PARENT_ID, named_id, malformed_id})
+        for parent_id, subject, explanation in (
+            (PARENT_ID, by_id, "未找到该本地 Codex 会话"),
+            (named_id, by_name, "有多个同名会话"),
+            (malformed_id, "[AI会话][123]", "完整的本地会话 ID"),
+        ):
+            response = replies[parent_id]
+            self.assertEqual(str(response["To"]), SENDER)
+            self.assertEqual(str(response["Subject"]), "Re: " + subject)
+            self.assertEqual(str(response["Auto-Submitted"]), "auto-replied")
+            self.assertIn(explanation, response.get_content())
+            self.assertIsNone(inbox.parse_mail(response.as_bytes(), MAILBOX)[0])
+        self.assertEqual(str(replies[PARENT_ID]["References"]), f"{ROOT_ID} {PARENT_ID}")
+        self.assertFalse(mail.find_reply_chat(MAILBOX, SENDER, "", (str(replies[PARENT_ID]["Message-ID"]),), ()))
+
+    def test_busy_rpc_is_retried_without_a_failure_receipt(self):
+        command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
+        error = inbox.RpcError("thread/resume", {"code": -32600, "message": "thread already has an active writer"})
+        with patch.object(inbox, "submit_command", side_effect=error), self.assertRaises(inbox.RpcError):
+            inbox.submit_or_record_failure(self.db, self.config, command, 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM failed_replies").fetchone(), (0,))
 
 
 if __name__ == "__main__":

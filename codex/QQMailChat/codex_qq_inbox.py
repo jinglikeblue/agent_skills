@@ -230,6 +230,7 @@ class CommandMail:
     is_reply: bool = False
     subject: str = ""
     references: tuple[str, ...] = ()
+    rejection_reason: str | None = None
 
 
 def reply_ids(message, field):
@@ -266,33 +267,32 @@ def parse_mail(raw, mailbox=None):
     project = chat = ""
     thread_id = None
     is_reply = match is None
-    references = ()
+    rejection_reason = None
+    in_reply_to = reply_ids(message, "In-Reply-To")
+    references = reply_ids(message, "References")
     if match:
         target, chat_name = match.groups()
         target = target.strip()
         if chat_name is None:
-            if not re.fullmatch(mail.UUID_TEXT, target, re.IGNORECASE):
-                raise RejectedMail("请在 [AI会话][会话ID] 中填写完整的本地会话 ID。")
-            thread_id = mail.chat_id(target)
+            if re.fullmatch(mail.UUID_TEXT, target, re.IGNORECASE):
+                thread_id = mail.chat_id(target)
+            else:
+                rejection_reason = "请在 [AI会话][会话ID] 中填写完整的本地会话 ID。"
         else:
             project, chat = target, chat_name.strip()
             if not (project and chat):
-                raise RejectedMail("邮件缺少有效的项目名或会话名。")
+                rejection_reason = "邮件缺少有效的项目名或会话名。"
     else:
-        in_reply_to = reply_ids(message, "In-Reply-To")
-        references = reply_ids(message, "References")
         try:
             thread_id = mail.find_reply_chat(mailbox, sender, subject.strip(), in_reply_to, references)
         except ValueError as error:
             raise RejectedMail(str(error)) from error
         if thread_id is None:
             return None, message
-        references = tuple(dict.fromkeys((*references, *in_reply_to)))[-49:]
+    references = tuple(dict.fromkeys((*references, *in_reply_to)))[-49:]
     body = message.get_body(preferencelist=("plain", "html"))
-    if body is None:
-        raise RejectedMail("找不到邮件正文。")
-    text = body.get_content(errors="replace")
-    if body.get_content_subtype() == "html":
+    text = body.get_content(errors="replace") if body is not None else ""
+    if body is not None and body.get_content_subtype() == "html":
         parser = PlainText(stop_at_quote=is_reply)
         parser.feed(text)
         parser.close()
@@ -301,10 +301,14 @@ def parse_mail(raw, mailbox=None):
     if is_reply:
         text = reply_text(text)
     if not text:
-        raise RejectedMail("邮件正文为空。")
+        if is_reply:
+            raise RejectedMail("邮件正文为空。")
+        rejection_reason = rejection_reason or "请在邮件正文中填写要交给 Codex 的指令。"
+    # Retain a valid envelope across routing errors so poll can authenticate it before replying.
     return CommandMail(
         sender, message_id, project, chat, text,
         thread_id=thread_id, is_reply=is_reply, subject=subject, references=references,
+        rejection_reason=rejection_reason,
     ), message
 
 
@@ -440,7 +444,10 @@ def new_project_folder(root, name):
     path = root / name
     if path.is_symlink() or path.is_junction() or path.resolve().parent != root:
         raise RejectedMail("新项目文件夹超出了配置的根目录。")
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, FileExistsError, NotADirectoryError) as error:
+        raise RejectedMail("无法创建项目目录，请检查本机项目根目录的访问权限和同名文件。") from error
     return path
 
 
@@ -494,8 +501,12 @@ def resolve_chat(server, project_root, command):
     return resume_chat(server, thread)
 
 
+def submission_key(mailbox, message_id):
+    return hashlib.sha256(f"{mailbox}\0{message_id}".encode()).hexdigest()
+
+
 def submit_command(db, config, command, uid):
-    key = hashlib.sha256(f'{config["mailbox"]}\0{command.message_id}'.encode()).hexdigest()
+    key = submission_key(config["mailbox"], command.message_id)
     previous = db.execute("SELECT status FROM submissions WHERE message_key=?", (key,)).fetchone()
     if previous:
         if previous[0] == "submitting":
@@ -561,30 +572,101 @@ def submit_command(db, config, command, uid):
         print(f"UID {uid} 执行状态 {status}", flush=True)
 
 
-def deliver_reply(db, entry, conclusion):
-    client_id, thread_id, recipient, subject, parent_id, refs, protected_question = entry
-    with db:
-        db.execute("UPDATE reply_notifications SET status='sending' WHERE client_id=?", (client_id,))
+def rejection_reason(error):
+    if isinstance(error, RejectedMail):
+        return str(error)
+    if error.code == -32601:
+        return "当前 Codex 版本不支持所需的会话操作，请更新 Codex 后重试。"
+    if error.code not in {-32600, -32602} or any(hint in error.detail.casefold() for hint in (
+        "already has an active writer", "active or pending turn", "thread is busy",
+    )):
+        return None  # Busy chats and transport or server failures can still recover.
+    # The raw RPC error may include local paths or account details.
+    return {
+        "thread/read": "Codex 无法读取该会话，请核对本机会话 ID。",
+        "thread/resume": "Codex 无法重新打开该会话，请确认能在本机打开它。",
+        "thread/unarchive": "Codex 无法恢复该归档会话，请先在本机恢复它。",
+        "project/import": "Codex 无法添加该项目，请检查项目名称和本机项目目录。",
+        "thread/start": "Codex 无法在该项目中创建会话，请检查项目是否可用。",
+    }.get(error.method, "Codex 拒绝了这封邮件的会话操作，请核对项目或会话后重试。")
+
+
+def submit_or_record_failure(db, config, command, uid):
+    if command.is_reply:
+        submit_command(db, config, command, uid)
+        return
     try:
-        question = mail.windows_protect(protected_question, encrypt=False).decode("utf-8") if protected_question else ""
+        if command.rejection_reason:
+            raise RejectedMail(command.rejection_reason)
+        submit_command(db, config, command, uid)
+    except (RejectedMail, RpcError) as error:
+        reason = rejection_reason(error)
+        if reason is None:
+            raise
+        key = submission_key(config["mailbox"], command.message_id)
+        # Record the receipt before advancing the inbox cursor. Duplicate UIDs with the same
+        # Message-ID see this claim and cannot resubmit the command or enqueue another receipt.
+        with db:
+            if not db.execute("INSERT OR IGNORE INTO submissions VALUES (?, NULL, NULL, 'rejected')", (key,)).rowcount:
+                return
+            db.execute(
+                "INSERT INTO failed_replies (client_id, mailbox, recipient, subject, parent_id, refs, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid5(NAMESPACE_URL, key)), config["mailbox"], command.sender, command.subject,
+                 command.message_id, json.dumps(command.references), reason),
+            )
+        print(f"UID {uid} 已登记失败回执。{reason}", flush=True)
+
+
+def send_queued_reply(client_id, recipient, subject, parent_id, refs, body, *, thread_id=None):
+    try:
         mail.send_notice(
             test=False, recipient=recipient, subject=subject, thread_id=thread_id,
-            body=mail.notice_body(question, conclusion), reply=(parent_id, json.loads(refs), client_id),
+            body=body, reply=(parent_id, json.loads(refs), client_id),
         )
     except mail.ReplyDeliveryUncertain:
         # A disconnect during SMTP DATA may have hidden a successful delivery.
-        with db:
-            db.execute("UPDATE reply_notifications SET status='uncertain', question=NULL WHERE client_id=?", (client_id,))
-        print("完成回信投递结果未知，已跳过自动重发。", flush=True)
-        return
+        print("回信投递结果未知，已跳过自动重发。", flush=True)
+        return "uncertain"
     except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+        print(f"回信暂时失败（{type(error).__name__}），下一次轮询重试。", flush=True)
+        return "pending"
+    return "sent"
+
+
+def deliver_failed_replies(db, mailbox):
+    rows = db.execute(
+        "SELECT client_id, recipient, subject, parent_id, refs, reason FROM failed_replies "
+        "WHERE mailbox=? AND status='pending' ORDER BY rowid", (mailbox,),
+    ).fetchall()
+    for client_id, recipient, subject, parent_id, refs, reason in rows:
         with db:
-            db.execute("UPDATE reply_notifications SET status='pending' WHERE client_id=?", (client_id,))
-        print(f"完成回信暂时失败（{type(error).__name__}），下一次轮询重试。", flush=True)
+            db.execute("UPDATE failed_replies SET status='sending' WHERE client_id=?", (client_id,))
+        body = f"这封邮件中的指令未能提交给 Codex。\n\n原因\n{reason}\n"
+        status = send_queued_reply(client_id, recipient, subject, parent_id, refs, body)
+        with db:
+            db.execute("UPDATE failed_replies SET status=? WHERE client_id=?", (status, client_id))
+        if status == "sent":
+            print("已发送失败回执。", flush=True)
+
+
+def deliver_reply(db, entry, conclusion):
+    client_id, thread_id, recipient, subject, parent_id, refs, protected_question = entry
+    try:
+        question = mail.windows_protect(protected_question, encrypt=False).decode("utf-8") if protected_question else ""
+    except (OSError, UnicodeError) as error:
+        print(f"暂时无法读取完成回信正文（{type(error).__name__}）。", flush=True)
         return
     with db:
-        db.execute("UPDATE reply_notifications SET status='sent', question=NULL WHERE client_id=?", (client_id,))
-    print("已发送完成回信。", flush=True)
+        db.execute("UPDATE reply_notifications SET status='sending' WHERE client_id=?", (client_id,))
+    body = mail.notice_body(question, conclusion)
+    status = send_queued_reply(client_id, recipient, subject, parent_id, refs, body, thread_id=thread_id)
+    with db:
+        db.execute("UPDATE reply_notifications SET status=?, question=? WHERE client_id=?", (
+            status, protected_question if status == "pending" else None, client_id,
+        ))
+    if status == "sent":
+        print("已发送完成回信。", flush=True)
 
 
 def deliver_completed_replies(db, mailbox):
@@ -663,7 +745,7 @@ def poll(db, config):
                     if command:
                         if not authenticated(box, config, command, message):
                             raise RejectedMail("发件身份验证未通过。")
-                        submit_command(db, config, command, uid)
+                        submit_or_record_failure(db, config, command, uid)
             except RejectedMail as error:
                 print(f"UID {uid} 已跳过。{error}", flush=True)
             checkpoint(db, config["mailbox"], validity, uid)
@@ -725,8 +807,13 @@ def run(config):
         init_state(db)
         with db:
             db.execute("UPDATE reply_notifications SET status='uncertain', question=NULL WHERE status='sending'")
+            db.execute("UPDATE failed_replies SET status='uncertain' WHERE status='sending'")
         print("QQ 收信程序正在运行。按 Ctrl+C 停止。", flush=True)
         while True:
+            try:
+                deliver_failed_replies(db, config["mailbox"])
+            except sqlite3.Error as error:
+                print(f"暂时无法查询失败回执（{type(error).__name__}）。", flush=True)
             try:
                 deliver_completed_replies(db, config["mailbox"])
             except (OSError, sqlite3.Error) as error:
@@ -735,7 +822,7 @@ def run(config):
                 poll(db, config)
             except BusyThread:
                 print("目标会话正在运行，下一次轮询重试。", flush=True)
-            except (OSError, imaplib.IMAP4.error, RpcError) as error:
+            except (OSError, sqlite3.Error, imaplib.IMAP4.error, RpcError) as error:
                 detail = str(error) if isinstance(error, RpcError) else type(error).__name__
                 print(f"收信或提交暂时失败（{detail}），下一次轮询重试。", flush=True)
             time.sleep(POLL_SECONDS)
@@ -752,6 +839,12 @@ def init_state(db):
         );
         CREATE INDEX IF NOT EXISTS inbox_reply_recipient ON reply_notifications(thread_id, recipient);
         CREATE INDEX IF NOT EXISTS inbox_pending_reply ON reply_notifications(mailbox, status);
+        CREATE TABLE IF NOT EXISTS failed_replies (
+            client_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, recipient TEXT NOT NULL,
+            subject TEXT NOT NULL, parent_id TEXT NOT NULL, refs TEXT NOT NULL, reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+        CREATE INDEX IF NOT EXISTS inbox_pending_failure ON failed_replies(mailbox, status);
     """)
 
 
