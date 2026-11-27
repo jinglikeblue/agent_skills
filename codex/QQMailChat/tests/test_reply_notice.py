@@ -172,13 +172,16 @@ class ReplyNotificationTest(unittest.TestCase):
         # A reply header on an explicit-ID command cannot bypass its normal sender checks.
         command, message = self.command_email(f"[AI会话][{THREAD}]", "请继续。", in_reply_to=ROOT_ID)
         with (patch.object(inbox, "qq_dmarc_passes", return_value=True) as dmarc,
-              patch.object(inbox, "qq_reply_spf_passes", return_value=True) as spf):
-            self.assertFalse(inbox.authenticated(None, {**self.config, "senders": [MAILBOX]}, command, message))
+              patch.object(inbox, "qq_spf_passes", return_value=True) as spf):
+            disallowed = {**self.config, "senders": [MAILBOX], "spf_senders": [SENDER]}
+            self.assertFalse(inbox.authenticated(None, disallowed, command, message))
             allowed = {**self.config, "senders": [SENDER]}
             self.assertTrue(inbox.authenticated(None, allowed, command, message))
             dmarc.return_value = False
             self.assertFalse(inbox.authenticated(None, allowed, command, message))
             spf.assert_not_called()
+            self.assertTrue(inbox.authenticated(None, {**allowed, "spf_senders": [SENDER]}, command, message))
+            spf.assert_called_once_with(message, SENDER)
 
     def test_name_format_and_invalid_id(self):
         command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")

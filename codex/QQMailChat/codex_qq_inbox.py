@@ -333,7 +333,7 @@ def qq_dmarc_passes(message, sender):
     )
 
 
-def qq_reply_spf_passes(message, sender):
+def qq_spf_passes(message, sender):
     # QQ's inbound header block follows its Received trace on some enterprise mail paths.
     first_received = False
     qq_trace = set()
@@ -421,9 +421,9 @@ def authenticated(box, config, command, message):
         return False
     if command.sender == config["mailbox"]:
         return sent_copy_matches(box, command, config["mailbox"])
-    return qq_dmarc_passes(message, command.sender) or (
-        command.is_reply and qq_reply_spf_passes(message, command.sender)
-    )
+    # Standalone commands may use SPF only when that allowlisted address opted in.
+    allow_spf = command.is_reply or command.sender in config.get("spf_senders", ())
+    return qq_dmarc_passes(message, command.sender) or (allow_spf and qq_spf_passes(message, command.sender))
 
 
 def exactly_one(items, name, kind):
@@ -705,7 +705,14 @@ def setup():
         protected = base64.b64encode(mail.windows_protect(code.encode("ascii"), encrypt=True)).decode("ascii")
     else:
         raise ValueError("请输入 QQ 邮箱 IMAP 授权码。")
-    mail.write_json(CONFIG, {"mailbox": mailbox, "senders": senders, "project_root": str(root), "protected_code": protected})
+    previous = json.loads(CONFIG.read_text(encoding="utf-8-sig")) if CONFIG.is_file() else {}
+    settings = {"mailbox": mailbox, "senders": senders, "project_root": str(root), "protected_code": protected}
+    # Retain SPF opt-ins only for addresses still allowed on this same mailbox.
+    if previous.get("mailbox", "").casefold() == mailbox:
+        retained = sorted(set(previous.get("spf_senders", ())).intersection(senders))
+        if retained:
+            settings["spf_senders"] = retained
+    mail.write_json(CONFIG, settings)
     if not outgoing:
         # A fresh installation can share one QQ credential for SMTP and IMAP setup.
         mail.write_json(mail.SETTINGS, {"sender": mailbox, "recipient": mailbox, "protected_code": protected})
