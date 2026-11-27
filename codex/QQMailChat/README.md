@@ -40,6 +40,27 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File (Join-Path $m
 
 先运行 `python -I -X utf8 $mail test`，确认能收到测试邮件。测试邮件默认发至已配置的 QQ 邮箱。
 
+### 每轮结束自动发邮件
+
+给目标会话开启**长期邮件通知**，只需设置一次。之后这条会话每轮结束时都会自动向订阅地址发送通知，直到关闭订阅。使用前请配置 SMTP，并在 Codex 中信任 `Stop` Hook。
+
+直接在目标 Codex 会话里说下面这句话，将示例地址换成你的收件邮箱。
+
+> 给当前会话开启长期邮件通知。以后这条会话每轮结束时，都发邮件给 `name@example.com`，直到我关闭。
+
+也可以复制目标会话的 `codex://threads/…` 链接或完整会话 ID，在[配置邮箱](#配置邮箱)所用的 PowerShell 窗口中运行：
+
+```powershell
+$chat = Get-Clipboard -Raw
+python -I -X utf8 $mail enable $chat 'name@example.com'
+```
+
+再次执行 `enable` 可以更换这条会话的订阅地址。若某轮临时指定了收件人，那一轮优先使用临时地址。
+
+运行 `python -I -X utf8 $mail list` 可以查看已订阅的会话。要关闭订阅，先确认 `$chat` 是目标会话的链接或 ID，再运行 `python -I -X utf8 $mail disable $chat`。
+
+### 只通知当前一轮
+
 在本机 Codex 任务末尾另起一行，写 `完成后邮件通知`。首次省略地址时会打开 Windows 输入框，填入地址后点「保存」。本轮和之后省略地址的通知都使用该邮箱。取消、关闭窗口或等待超时后可在下次重新输入。
 
 要更换默认邮箱，在本机 Codex 单独发送 `修改默认接收通知邮件地址`。窗口会预填当前地址，保存后以后省略地址的通知会使用新地址。取消或关闭窗口会保留原地址。
@@ -50,15 +71,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File (Join-Path $m
 结束后邮件通知 name@example.com
 ```
 
-本轮结束时发送一次。邮件主题使用 `[完成通知][工作目录名][会话名]`，正文包含本轮问题及最终答复。工作目录名优先用 Codex 侧栏中与该目录唯一匹配的显示名，其次用实际文件夹名。需要每轮都收到通知时，复制目标会话链接，再执行以下命令。`enable` 可再次运行以更换收件人，本轮显式指定的地址优先。
-
-```powershell
-$chat = Get-Clipboard -Raw
-python -I -X utf8 $mail enable $chat 'name@example.com'
-python -I -X utf8 $mail list
-# 需要关闭订阅时运行下面的命令。
-python -I -X utf8 $mail disable $chat
-```
+本轮结束时发送一次。长期和单轮通知的主题均以 `[完成通知][工作目录名][会话名]` 开头，正文包含本轮问题及最终答复。工作目录名优先用 Codex 侧栏中与该目录唯一匹配的显示名，其次用实际文件夹名。
 
 ## 用邮件发起任务或续聊
 
