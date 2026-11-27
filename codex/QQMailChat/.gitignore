@@ -1,0 +1,9 @@
+# Local QQ Mail configuration, message routing, and listener state.
+settings.json
+inbox-settings.json
+hooks.json.qqmailchat.bak
+routes/
+*.sqlite3*
+*.log
+inbox.lock
+__pycache__/
