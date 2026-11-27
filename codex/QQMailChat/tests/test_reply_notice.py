@@ -230,14 +230,22 @@ class ReplyNotificationTest(unittest.TestCase):
             self.assertTrue(inbox.authenticated(None, {**allowed, "spf_senders": [SENDER]}, command, message))
             spf.assert_called_once_with(message, SENDER)
 
-    def test_name_format_and_invalid_id(self):
+    def test_subject_formats_default_names_to_global_and_keep_full_ids(self):
         command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
         self.assertEqual((command.workspace, command.chat, command.thread_id), ("测试项目", "测试会话", None))
-        for bad_id in ("", "01234567", "not-an-id"):
-            with self.subTest(bad_id=bad_id):
-                invalid, _ = self.command_email(f"[AI会话][{bad_id}]", "请继续。")
-                self.assertIn("完整的本地会话 ID", invalid.rejection_reason)
-                self.assertIsNone(invalid.thread_id)
+        for prefix in ("AI会话", "AIChat", "aichat", "AiChAt"):
+            with self.subTest(prefix=prefix):
+                for target in ("[测试会话]", "[Global][测试会话]"):
+                    named, _ = self.command_email(f"[{prefix}]{target}", "请继续。")
+                    self.assertEqual((named.workspace, named.chat, named.thread_id), ("Global", "测试会话", None))
+                    self.assertIsNone(named.rejection_reason)
+                by_id, _ = self.command_email(f"[{prefix}][{THREAD.upper()}]", "请继续。")
+                self.assertEqual((by_id.workspace, by_id.chat, by_id.thread_id), ("", "", THREAD))
+                self.assertIsNone(by_id.rejection_reason)
+        numeric, _ = self.command_email("[AIChat][123]", "请继续。")
+        self.assertEqual((numeric.workspace, numeric.chat, numeric.thread_id), ("Global", "123", None))
+        invalid, _ = self.command_email("[AIChat][]", "请继续。")
+        self.assertIn("缺少有效的会话名", invalid.rejection_reason)
 
     def test_missing_id_is_rejected_without_attempting_to_resume_or_create(self):
         command, _ = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
@@ -256,7 +264,7 @@ class ReplyNotificationTest(unittest.TestCase):
         messages = {
             1: self.raw_email(by_id, "测试找不到的会话。", in_reply_to=ROOT_ID),
             2: self.raw_email(by_name, "测试重名的会话。", message_id=named_id),
-            3: self.raw_email("[AI会话][123]", "测试无效的会话 ID。", message_id=malformed_id),
+            3: self.raw_email("[AIChat][]", "测试空会话名。", message_id=malformed_id),
             4: self.raw_email(by_id, "未授权。", sender="unknown@example.com", message_id="<unknown@example.com>"),
         }
         messages[5] = messages[1]
@@ -296,7 +304,7 @@ class ReplyNotificationTest(unittest.TestCase):
         for parent_id, subject, explanation in (
             (PARENT_ID, by_id, "未找到该本地 Codex 会话"),
             (named_id, by_name, "有多个同名会话"),
-            (malformed_id, "[AI会话][123]", "完整的本地会话 ID"),
+            (malformed_id, "[AIChat][]", "缺少有效的会话名"),
         ):
             response = replies[parent_id]
             self.assertEqual(str(response["To"]), SENDER)

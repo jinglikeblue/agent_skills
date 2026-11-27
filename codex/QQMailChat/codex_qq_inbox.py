@@ -34,7 +34,8 @@ CONFIG = DIRECTORY / "inbox-settings.json"
 PROJECT_ROOT = Path.home() / "CodexMailProjects"
 POLL_SECONDS = 30
 MAIL_SIZE = 1024 * 1024
-SUBJECT = re.compile(r"\[AI会话\]\s*\[([^\[\]\r\n]*)\](?:\s*\[([^\[\]\r\n]*)\])?")
+DEFAULT_WORKSPACE = "Global"
+SUBJECT = re.compile(r"\[(?:AI会话|(?i:AIChat))\]\s*\[([^\[\]\r\n]*)\](?:\s*\[([^\[\]\r\n]*)\])?")
 CLIENT_ID = re.compile(r"<[!-~]{1,254}>")
 REPLY_ID = re.compile(r"<[^<>\s]{1,254}>")
 QUOTE_START = re.compile(
@@ -274,10 +275,13 @@ def parse_mail(raw, mailbox=None):
         target, chat_name = match.groups()
         target = target.strip()
         if chat_name is None:
+            # A full conversation ID takes precedence over a shorthand chat name.
             if re.fullmatch(mail.UUID_TEXT, target, re.IGNORECASE):
                 thread_id = mail.chat_id(target)
             else:
-                rejection_reason = "请在 [AI会话][会话ID] 中填写完整的本地会话 ID。"
+                workspace, chat = DEFAULT_WORKSPACE, mail.subject_label(target)
+                if not chat:
+                    rejection_reason = "邮件缺少有效的会话名或会话 ID。"
         else:
             workspace, chat = mail.subject_label(target), mail.subject_label(chat_name)
             if not (workspace and chat):
