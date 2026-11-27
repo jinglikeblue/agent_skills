@@ -198,10 +198,34 @@ class ReplyNotificationTest(unittest.TestCase):
         self.assertEqual(str(response["In-Reply-To"]), PARENT_ID)
         self.assertEqual(str(response["References"]), f"{ROOT_ID} {PARENT_ID}")
         self.assertEqual(str(response["Subject"]), "Re: " + SUBJECT)
-        self.assertIn("本轮已完成。", response.get_content())
+        self.assertIn("本轮已完成。", response.get_body(("plain",)).get_content())
+        self.assertIn("本轮已完成。", response.get_body(("html",)).get_content())
         self.assertEqual(inbox.parse_mail(response.as_bytes(), MAILBOX)[0], None)
         for headers in ((str(response["Message-ID"]),), ()):
             self.assertEqual(mail.find_reply_chat(MAILBOX, SENDER, "Re: " + SUBJECT, headers, ()), THREAD)
+
+    def test_completion_mail_offers_safe_html_and_plain_text(self):
+        body = (
+            "问题\n<img src=external>\n\n结论\n# 使用手册\n"
+            "1. 阅读 **操作指南**。\n2. [仓库](https://example.com/guide)\n\n"
+            "| 选项 | 用途 |\n| --- | --- |\n| `run` | 开始监听 |\n\n"
+            "```powershell\nWrite-Output '<测试>'\n```\n\n"
+            "> 使用原邮件地址回复。\n[不安全](javascript:bad)\n"
+        )
+        with patch.object(mail.smtplib, "SMTP_SSL") as connection:
+            smtp = connection.return_value.__enter__.return_value
+            mail.send_notice(test=False, recipient=SENDER, subject="流程测试", body=body)
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        self.assertEqual(message.get_body(("plain",)).get_content(), body)
+        html = message.get_body(("html",)).get_content()
+        for expected in (
+            '<meta name="viewport"', "&lt;img src=external&gt;", "</h1>", "<ol ", "<strong>操作指南</strong>",
+            'href="https://example.com/guide"', "<table ", "<blockquote ", "white-space:pre-wrap", "&lt;测试&gt;",
+        ):
+            self.assertIn(expected, html)
+        self.assertNotIn("<img", html)
+        self.assertNotIn('href="javascript:', html)
 
     def test_stop_only_suppresses_matching_turn_and_recipient(self):
         self.record_turn(self.queue_reply())
@@ -316,7 +340,8 @@ class ReplyNotificationTest(unittest.TestCase):
         self.assertEqual(str(response["To"]), SENDER)
         self.assertEqual(str(response["Subject"]), "Re: " + subject)
         self.assertEqual(str(response["In-Reply-To"]), PARENT_ID)
-        self.assertIn("已经完成。", response.get_content())
+        self.assertIn("已经完成。", response.get_body(("plain",)).get_content())
+        self.assertIn("已经完成。", response.get_body(("html",)).get_content())
         followup, _ = inbox.parse_mail(self.raw_email(
             str(response["Subject"]), "请继续。\n> 已经完成。", in_reply_to=str(response["Message-ID"]),
             message_id="<followup@example.com>",
@@ -461,7 +486,8 @@ class ReplyNotificationTest(unittest.TestCase):
             self.assertEqual(str(response["To"]), SENDER)
             self.assertEqual(str(response["Subject"]), "Re: " + subject)
             self.assertEqual(str(response["Auto-Submitted"]), "auto-replied")
-            self.assertIn(explanation, response.get_content())
+            self.assertIn(explanation, response.get_body(("plain",)).get_content())
+            self.assertIn(explanation, response.get_body(("html",)).get_content())
             self.assertIsNone(inbox.parse_mail(response.as_bytes(), MAILBOX)[0])
         self.assertEqual(str(replies[PARENT_ID]["References"]), f"{ROOT_ID} {PARENT_ID}")
         self.assertFalse(mail.find_reply_chat(MAILBOX, SENDER, "", (str(replies[PARENT_ID]["Message-ID"]),), ()))

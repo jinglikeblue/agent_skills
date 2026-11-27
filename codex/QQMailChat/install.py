@@ -11,6 +11,7 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
 SCRIPTS = (
+    "qq_mail_format.py",
     "codex_qq_mail.py",
     "codex_qq_inbox.py",
     "qq_mail_credentials.py",

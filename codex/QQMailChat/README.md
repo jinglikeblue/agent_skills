@@ -40,6 +40,8 @@ powershell.exe -NoProfile -STA -ExecutionPolicy RemoteSigned -File (Join-Path $m
 
 先运行 `python -I -X utf8 $mail test`，确认能收到测试邮件。测试邮件默认发至已配置的 QQ 邮箱。
 
+完成通知、自动回信和失败回执均提供适合手机阅读的 HTML 正文和纯文本备用版本。常用 Markdown 标题、列表、表格、引用、代码块和链接会在 HTML 中排版显示。
+
 ### 每轮结束自动发邮件
 
 给目标会话开启**长期邮件通知**，只需设置一次。之后这条会话每轮结束时都会自动向订阅地址发送通知，直到关闭订阅。使用前请配置 SMTP，并在 Codex 中信任 `Stop` Hook。

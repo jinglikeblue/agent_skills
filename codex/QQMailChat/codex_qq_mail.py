@@ -5,6 +5,7 @@ import base64
 import ctypes
 import getpass
 import hashlib
+import importlib.util
 import json
 import ntpath
 import os
@@ -29,6 +30,10 @@ from uuid import UUID
 
 
 SETTINGS = Path(__file__).resolve().with_name("settings.json")
+# Load the installed sibling by path because the hook runs Python in isolated mode.
+format_spec = importlib.util.spec_from_file_location("qq_mail_format", SETTINGS.with_name("qq_mail_format.py"))
+mail_format = importlib.util.module_from_spec(format_spec)
+format_spec.loader.exec_module(mail_format)
 CODEX_PROFILE = SETTINGS.parent.parent
 ROUTES = SETTINGS.with_name("routes")
 TURN_NOTICES = SETTINGS.with_name("turn-notices.sqlite3")
@@ -304,7 +309,9 @@ def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None
             # Clients that strip reply headers can still route using the subject.
             base_subject += f"[续聊码 {token}]"
         message["Subject"] = base_subject
-    message.set_content("QQ 邮箱通知配置测试。" if test else body)
+    text = "QQ 邮箱通知配置测试。" if test else body
+    message.set_content(text)
+    message.add_alternative(mail_format.email_html(text), subtype="html")
 
     accepted = False
     try:
