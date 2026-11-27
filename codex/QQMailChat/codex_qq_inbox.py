@@ -223,7 +223,7 @@ class PlainText(HTMLParser):
 class CommandMail:
     sender: str
     message_id: str
-    project: str
+    workspace: str
     chat: str
     text: str
     thread_id: str | None = None
@@ -264,7 +264,7 @@ def parse_mail(raw, mailbox=None):
     if any(char in message_id[1:-1] for char in '<>\\"'):
         raise RejectedMail("邮件 Message-ID 格式无效。")
     sender = addresses[0].addr_spec.casefold()
-    project = chat = ""
+    workspace = chat = ""
     thread_id = None
     is_reply = match is None
     rejection_reason = None
@@ -279,9 +279,9 @@ def parse_mail(raw, mailbox=None):
             else:
                 rejection_reason = "请在 [AI会话][会话ID] 中填写完整的本地会话 ID。"
         else:
-            project, chat = target, chat_name.strip()
-            if not (project and chat):
-                rejection_reason = "邮件缺少有效的项目名或会话名。"
+            workspace, chat = mail.subject_label(target), mail.subject_label(chat_name)
+            if not (workspace and chat):
+                rejection_reason = "邮件缺少有效的工作目录名或会话名。"
     else:
         try:
             thread_id = mail.find_reply_chat(mailbox, sender, subject.strip(), in_reply_to, references)
@@ -306,7 +306,7 @@ def parse_mail(raw, mailbox=None):
         rejection_reason = rejection_reason or "请在邮件正文中填写要交给 Codex 的指令。"
     # Retain a valid envelope across routing errors so poll can authenticate it before replying.
     return CommandMail(
-        sender, message_id, project, chat, text,
+        sender, message_id, workspace, chat, text,
         thread_id=thread_id, is_reply=is_reply, subject=subject, references=references,
         rejection_reason=rejection_reason,
     ), message
@@ -430,11 +430,11 @@ def authenticated(box, config, command, message):
     return qq_dmarc_passes(message, command.sender) or (allow_spf and qq_spf_passes(message, command.sender))
 
 
-def exactly_one(items, name, kind):
-    matches = [item for item in items if item.get("name") == name]
+def unique_named_chat(threads):
+    matches = {thread["id"]: thread for thread in threads}
     if len(matches) > 1:
-        raise RejectedMail(f"有多个同名{kind}，请给目标改成唯一名称。")
-    return next(iter(matches), None)
+        raise RejectedMail("有多个同名会话，请使用 [AI会话][会话ID] 指定目标。")
+    return next(iter(matches.values()), None)
 
 
 def new_project_folder(root, name):
@@ -460,6 +460,38 @@ def resume_chat(server, thread):
     return thread["id"]
 
 
+def named_chats(server, title, *, archived=False):
+    filters = {"currentAccountOnly": True, "archived": archived,
+               "sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"]}
+    # An unchanged fragment narrows the lookup even if the mail label normalized spaces or brackets.
+    fragment = max(re.split(r"[\s［］]+", title), key=len)
+    if fragment:
+        filters["searchTerm"] = fragment
+    return [thread for thread in server.pages("thread/list", **filters) if mail.subject_label(thread.get("name")) == title]
+
+
+def registered_workspaces(projects, name):
+    matches = {}
+    for project in projects:
+        named = mail.subject_label(project.get("name")).casefold() == name
+        for root in project["roots"]:
+            path = root["path"]
+            key = mail.workspace_key(path)
+            if key and (named or mail.subject_label(mail.workspace_basename(path)).casefold() == name):
+                matches[(project["id"], key)] = (project, path)
+    return matches
+
+
+def is_in_workspace(thread, name, roots):
+    cwd = thread.get("cwd")
+    return mail.workspace_key(cwd) in roots or mail.subject_label(mail.workspace_basename(cwd)).casefold() == name
+
+
+def resume_archived_chat(server, thread):
+    restored = server.call("thread/unarchive", {"threadId": thread["id"]})["thread"]
+    return resume_chat(server, restored)
+
+
 def resolve_chat(server, project_root, command):
     if command.thread_id:
         try:
@@ -471,34 +503,56 @@ def resolve_chat(server, project_root, command):
                 raise RejectedMail("未找到该本地 Codex 会话。请核对会话 ID。") from error
             raise
         return resume_chat(server, thread)
-    project = exactly_one(server.pages("project/list"), command.project, "项目")
+    name = command.workspace.casefold()
+    projects = list(server.pages("project/list"))
+    workspaces = registered_workspaces(projects, name)
+    root_keys = {key for _, key in workspaces}
+    active = named_chats(server, command.chat)
+    thread = unique_named_chat(thread for thread in active if is_in_workspace(thread, name, root_keys))
+    if thread:
+        return resume_chat(server, thread)
+    archived = named_chats(server, command.chat, archived=True)
+    thread = unique_named_chat(thread for thread in archived if is_in_workspace(thread, name, root_keys))
+    if thread:
+        return resume_archived_chat(server, thread)
+
+    # Legacy mail can still identify an explicitly assigned project after the workspace search.
+    named_projects = [project for project in projects if mail.subject_label(project.get("name")).casefold() == name]
+    if len(named_projects) > 1:
+        raise RejectedMail("有多个同名项目，请使用 [AI会话][会话ID] 指定已有会话。")
+    project = next(iter(named_projects), None)
+    if project:
+        thread = unique_named_chat(thread for thread in active if thread.get("projectId") == project["id"])
+        if thread:
+            return resume_chat(server, thread)
+        thread = unique_named_chat(thread for thread in archived if thread.get("projectId") == project["id"])
+        if thread:
+            return resume_archived_chat(server, thread)
+
+    cwd = None
+    if project is None and workspaces:
+        if len(workspaces) != 1:
+            raise RejectedMail("有多个同名工作目录，请使用 [AI会话][会话ID] 指定已有会话。")
+        project, cwd = next(iter(workspaces.values()))
     if project is None:
-        path = new_project_folder(project_root, command.project)
+        path = new_project_folder(project_root, command.workspace)
         project = server.call("project/import", {
-            "name": command.project,
+            "name": command.workspace,
             "roots": [{"path": str(path)}],
             "idempotencyKey": str(uuid5(NAMESPACE_URL, f"codex-qq-mail-project:{path}")),
         })["project"]
 
-    filters = {"projectId": project["id"], "currentAccountOnly": True,
-               "sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"]}
-    thread = exactly_one(server.pages("thread/list", **filters), command.chat, "会话")
-    if thread is None:
-        archived = exactly_one(server.pages("thread/list", **filters, archived=True), command.chat, "归档会话")
-        if archived:
-            thread = server.call("thread/unarchive", {"threadId": archived["id"]})["thread"]
-    if thread is None:
-        roots = [item["path"] for item in project["roots"]]
-        if not roots or not Path(roots[0]).is_dir():
-            raise RejectedMail("项目主目录在这台 Windows 电脑上不可用。")
-        thread = server.call("thread/start", {
-            "cwd": roots[0], "runtimeWorkspaceRoots": roots,
-            "projectId": project["id"], "ephemeral": False,
-            "sandbox": "workspace-write", "approvalPolicy": "never",
-        })["thread"]
-        server.call("thread/name/set", {"threadId": thread["id"], "name": command.chat})
-        return thread["id"]
-    return resume_chat(server, thread)
+    roots = [item["path"] for item in project["roots"]]
+    cwd = cwd or next(iter(roots), None)
+    if not cwd or not Path(cwd).is_dir():
+        raise RejectedMail("工作目录在这台 Windows 电脑上不可用。")
+    thread = server.call("thread/start", {
+        "cwd": cwd, "runtimeWorkspaceRoots": roots,
+        "projectId": project["id"], "ephemeral": False,
+        "sandbox": "workspace-write", "approvalPolicy": "never",
+    })["thread"]
+    server.call("thread/name/set", {"threadId": thread["id"], "name": command.chat})
+    return thread["id"]
 
 
 def submission_key(mailbox, message_id):

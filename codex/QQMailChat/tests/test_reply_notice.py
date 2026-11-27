@@ -188,7 +188,7 @@ class ReplyNotificationTest(unittest.TestCase):
 
     def test_name_format_and_invalid_id(self):
         command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
-        self.assertEqual((command.project, command.chat, command.thread_id), ("测试项目", "测试会话", None))
+        self.assertEqual((command.workspace, command.chat, command.thread_id), ("测试项目", "测试会话", None))
         for bad_id in ("", "01234567", "not-an-id"):
             with self.subTest(bad_id=bad_id):
                 invalid, _ = self.command_email(f"[AI会话][{bad_id}]", "请继续。")
@@ -228,9 +228,11 @@ class ReplyNotificationTest(unittest.TestCase):
               contextlib.redirect_stdout(io.StringIO())):
             server = connect.return_value.__enter__.return_value
             server.call.side_effect = inbox.RpcError("thread/read", {"code": -32600, "message": f"thread not loaded: {THREAD}"})
+            workspace = r"X:\Work\测试项目"
             server.pages.side_effect = [
-                [{"id": "project", "name": "测试项目"}],
-                [{"id": "first", "name": "测试会话"}, {"id": "second", "name": "测试会话"}],
+                [{"id": "project", "name": "测试项目", "roots": [{"path": workspace}]}],
+                [{"id": "first", "name": "测试会话", "cwd": workspace},
+                 {"id": "second", "name": "测试会话", "cwd": workspace}],
             ]
             inbox.poll(self.db, config)
         self.assertEqual(connect.call_count, 2)
@@ -268,6 +270,56 @@ class ReplyNotificationTest(unittest.TestCase):
             inbox.submit_or_record_failure(self.db, self.config, command, 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM failed_replies").fetchone(), (0,))
 
+    def test_workspace_display_name_and_basename_beat_a_legacy_project_match(self):
+        project = {"id": "tools", "name": "工具工程", "roots": [{"path": "X:/Projects/Tools"}]}
+        wanted = {"id": THREAD, "name": "测试会话", "cwd": r"\\?\X:\Projects\Tools"}
+        older = {"id": "legacy", "name": wanted["name"], "cwd": r"X:\Elsewhere", "projectId": project["id"]}
+        for workspace in ("工具工程", "TOOLS"):
+            with self.subTest(workspace=workspace):
+                command, _ = self.command_email(f"[AI会话][{workspace}][测试会话]", "请继续。")
+                server = Mock()
+                server.pages.side_effect = [[project], [older, wanted]]
+                server.call.return_value = {"thread": wanted}
+                self.assertEqual(inbox.resolve_chat(server, Path(self.config["project_root"]), command), THREAD)
+                server.call.assert_called_once_with("thread/resume", {"threadId": THREAD, "excludeTurns": True})
+
+    def test_archived_workspace_match_beats_active_legacy_project(self):
+        command, _ = self.command_email("[AI会话][工具工程][测试会话]", "请继续。")
+        project = {"id": "tools", "name": "工具工程", "roots": [{"path": "X:/Projects/Tools"}]}
+        wanted = {"id": THREAD, "name": "测试会话", "cwd": r"X:\Projects\Tools"}
+        older = {"id": "legacy", "name": wanted["name"], "cwd": r"X:\Elsewhere", "projectId": project["id"]}
+        server = Mock()
+        server.pages.side_effect = [[project], [older], [wanted]]
+        server.call.side_effect = [{"thread": wanted}, {"thread": wanted}]
+        self.assertEqual(inbox.resolve_chat(server, Path(self.config["project_root"]), command), THREAD)
+        self.assertEqual([request.args[0] for request in server.call.call_args_list], ["thread/unarchive", "thread/resume"])
+
+    def test_unregistered_folder_and_legacy_project_still_resolve(self):
+        project = {"id": "tools", "name": "旧项目名", "roots": [{"path": "X:/Projects/Tools"}]}
+        wanted = {"id": THREAD, "name": "测试会话", "cwd": r"X:\Projects\Standalone", "projectId": project["id"]}
+        for workspace, projects in (("Standalone", []), ("旧项目名", [project])):
+            with self.subTest(workspace=workspace):
+                command, _ = self.command_email(f"[AI会话][{workspace}][测试会话]", "请继续。")
+                server = Mock()
+                server.pages.side_effect = [projects, [wanted], []]
+                server.call.return_value = {"thread": wanted}
+                self.assertEqual(inbox.resolve_chat(server, Path(self.config["project_root"]), command), THREAD)
+                server.call.assert_called_once_with("thread/resume", {"threadId": THREAD, "excludeTurns": True})
+
+    def test_new_chat_uses_the_requested_secondary_folder(self):
+        root = Path(self.config["project_root"])
+        primary, secondary = root / "Primary", root / "Secondary"
+        primary.mkdir()
+        secondary.mkdir()
+        project = {"id": "tools", "name": "工具工程", "roots": [{"path": str(primary)}, {"path": str(secondary)}]}
+        command, _ = self.command_email("[AI会话][Secondary][新会话]", "请开始。")
+        server = Mock()
+        server.pages.side_effect = [[project], [], []]
+        server.call.side_effect = [{"thread": {"id": THREAD}}, {}]
+        self.assertEqual(inbox.resolve_chat(server, root, command), THREAD)
+        method, params = server.call.call_args_list[0].args
+        self.assertEqual((method, params["cwd"], params["projectId"]), ("thread/start", str(secondary), "tools"))
+
 
 class NoticeProjectNameTest(unittest.TestCase):
     def setUp(self):
@@ -291,22 +343,22 @@ class NoticeProjectNameTest(unittest.TestCase):
         subject, _ = mail.notice_content(self.event, "测试问题")
         self.assertEqual(subject, "[完成通知][工具工程][测试会话]")
 
-    def test_explicit_assignment_takes_precedence(self):
+    def test_registered_workspace_name_beats_explicit_assignment(self):
         with self.db:
             self.db.execute("INSERT INTO projects VALUES ('explicit', '指定工程')")
             self.db.execute("UPDATE threads SET project_id='explicit'")
-        self.assertEqual(mail.project_and_chat(self.event), ("指定工程", "测试会话"))
+        self.assertEqual(mail.project_and_chat(self.event), ("工具工程", "测试会话"))
 
-    def test_ambiguous_workspace_retains_chat_name(self):
+    def test_ambiguous_workspace_uses_the_actual_folder_name(self):
         with self.db:
             self.db.execute("INSERT INTO projects VALUES ('other', '另一工程')")
             self.db.execute("INSERT INTO project_roots VALUES ('other', 'X:/Projects/Tools')")
-        self.assertEqual(mail.project_and_chat(self.event), ("未归属项目", "测试会话"))
+        self.assertEqual(mail.project_and_chat(self.event), ("Tools", "测试会话"))
 
-    def test_unavailable_workspace_lookup_retains_chat_name(self):
+    def test_unavailable_workspace_lookup_uses_the_actual_folder_name(self):
         with self.db:
             self.db.execute("DROP TABLE project_roots")
-        self.assertEqual(mail.project_and_chat(self.event), ("未归属项目", "测试会话"))
+        self.assertEqual(mail.project_and_chat(self.event), ("Tools", "测试会话"))
 
     def test_extended_unc_root_matches_standard_unc(self):
         self.assertEqual(mail.workspace_key(r"\\?\UNC\Server\Share\Tools"), mail.workspace_key(r"\\server\share\tools"))

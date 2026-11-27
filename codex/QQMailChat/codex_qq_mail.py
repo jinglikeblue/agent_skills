@@ -453,6 +453,15 @@ def workspace_key(path):
     return ntpath.normcase(ntpath.normpath(path)) if ntpath.isabs(path) else None
 
 
+def workspace_basename(path):
+    # Use the original spelling in outgoing mail and the normalized path for matching.
+    return ntpath.basename(ntpath.normpath(path)) if workspace_key(path) else ""
+
+
+def subject_label(label):
+    return " ".join((label or "").split()).translate(str.maketrans("[]", "［］"))
+
+
 def project_and_chat(event):
     # Query only the owning chat and its project in Codex's current local index.
     defaults = ("未归属项目", "未命名会话")
@@ -465,16 +474,17 @@ def project_and_chat(event):
     try:
         with closing(sqlite3.connect(latest.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
             row = db.execute(
-                "SELECT projects.name, threads.name, threads.project_id, threads.cwd "
+                "SELECT projects.name, threads.name, threads.cwd "
                 "FROM threads LEFT JOIN projects ON projects.id=threads.project_id "
                 "WHERE threads.id=?", (thread_id.lower(),),
             ).fetchone()
             if row is None:
                 return defaults
-            project, chat, project_id, cwd = row
+            project, chat, cwd = row
+            workspace = workspace_basename(cwd)
             cwd_key = workspace_key(cwd)
-            if project_id is None and cwd_key:
-                # A legacy chat can appear under its workspace project without a stored assignment.
+            if cwd_key:
+                # The same source directory can be used by chats assigned to other projects.
                 try:
                     candidates = {ident: name for ident, name, path in db.execute(
                         "SELECT projects.id, projects.name, project_roots.path FROM projects "
@@ -483,16 +493,15 @@ def project_and_chat(event):
                 except sqlite3.Error:
                     candidates = {}  # The optional workspace lookup should not hide the chat name.
                 if len(candidates) == 1:
-                    project = next(iter(candidates.values()))
+                    workspace = next(iter(candidates.values())) or workspace
     except sqlite3.Error:
         return defaults
-    return tuple(" ".join((label or fallback).split()) or fallback for label, fallback in zip((project, chat), defaults))
+    return tuple(subject_label(label) or fallback for label, fallback in zip((workspace or project, chat), defaults))
 
 
 def notice_content(event, question):
-    project, chat = project_and_chat(event)
-    labels = (label.translate(str.maketrans("[]", "［］")) for label in (project, chat))
-    subject = "[完成通知]" + "".join(f"[{label}]" for label in labels)
+    workspace, chat = project_and_chat(event)
+    subject = f"[完成通知][{workspace}][{chat}]"
     return subject, notice_body(question, event.get("last_assistant_message"))
 
 
