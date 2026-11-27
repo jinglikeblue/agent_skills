@@ -34,7 +34,7 @@ CONFIG = DIRECTORY / "inbox-settings.json"
 PROJECT_ROOT = Path.home() / "CodexMailProjects"
 POLL_SECONDS = 30
 MAIL_SIZE = 1024 * 1024
-SUBJECT = re.compile(r"\[AI会话\]\s*\[([^\[\]\r\n]+)\]\s*\[([^\[\]\r\n]+)\]")
+SUBJECT = re.compile(r"\[AI会话\]\s*\[([^\[\]\r\n]*)\](?:\s*\[([^\[\]\r\n]*)\])?")
 CLIENT_ID = re.compile(r"<[!-~]{1,254}>")
 REPLY_ID = re.compile(r"<[^<>\s]{1,254}>")
 QUOTE_START = re.compile(
@@ -227,6 +227,7 @@ class CommandMail:
     chat: str
     text: str
     thread_id: str | None = None
+    is_reply: bool = False
     subject: str = ""
     references: tuple[str, ...] = ()
 
@@ -257,15 +258,27 @@ def parse_mail(raw, mailbox=None):
     addresses = from_headers[0].addresses if len(from_headers) == 1 else ()
     message_ids = message.get_all("Message-ID", [])
     message_id = str(message_ids[0]).strip() if len(message_ids) == 1 else ""
-    project, chat = (part.strip() for part in match.groups()) if match else ("", "")
-    if len(addresses) != 1 or not CLIENT_ID.fullmatch(message_id) or (match and not (project and chat)):
-        raise RejectedMail("邮件缺少有效的发件邮箱、Message-ID 或会话信息。")
+    if len(addresses) != 1 or not CLIENT_ID.fullmatch(message_id):
+        raise RejectedMail("邮件缺少有效的发件邮箱或 Message-ID。")
     if any(char in message_id[1:-1] for char in '<>\\"'):
         raise RejectedMail("邮件 Message-ID 格式无效。")
     sender = addresses[0].addr_spec.casefold()
+    project = chat = ""
     thread_id = None
+    is_reply = match is None
     references = ()
-    if not match:
+    if match:
+        target, chat_name = match.groups()
+        target = target.strip()
+        if chat_name is None:
+            if not re.fullmatch(mail.UUID_TEXT, target, re.IGNORECASE):
+                raise RejectedMail("请在 [AI会话][会话ID] 中填写完整的本地会话 ID。")
+            thread_id = mail.chat_id(target)
+        else:
+            project, chat = target, chat_name.strip()
+            if not (project and chat):
+                raise RejectedMail("邮件缺少有效的项目名或会话名。")
+    else:
         in_reply_to = reply_ids(message, "In-Reply-To")
         references = reply_ids(message, "References")
         try:
@@ -280,16 +293,19 @@ def parse_mail(raw, mailbox=None):
         raise RejectedMail("找不到邮件正文。")
     text = body.get_content(errors="replace")
     if body.get_content_subtype() == "html":
-        parser = PlainText(stop_at_quote=bool(thread_id))
+        parser = PlainText(stop_at_quote=is_reply)
         parser.feed(text)
         parser.close()
         text = "".join(parser.text)
     text = text.replace("\r\n", "\n").strip()
-    if thread_id:
+    if is_reply:
         text = reply_text(text)
     if not text:
         raise RejectedMail("邮件正文为空。")
-    return CommandMail(sender, message_id, project, chat, text, thread_id, subject, references), message
+    return CommandMail(
+        sender, message_id, project, chat, text,
+        thread_id=thread_id, is_reply=is_reply, subject=subject, references=references,
+    ), message
 
 
 def qq_dmarc_passes(message, sender):
@@ -400,13 +416,13 @@ def sent_copy_matches(box, command, mailbox):
 
 
 def authenticated(box, config, command, message):
-    # A recorded recipient may reply to its existing chat. New chat commands use the allowlist.
-    if command.thread_id is None and command.sender not in config["senders"]:
+    # Only a reply to a registered notice can use the recipient's reply permissions.
+    if not command.is_reply and command.sender not in config["senders"]:
         return False
     if command.sender == config["mailbox"]:
         return sent_copy_matches(box, command, config["mailbox"])
     return qq_dmarc_passes(message, command.sender) or (
-        command.thread_id is not None and qq_reply_spf_passes(message, command.sender)
+        command.is_reply and qq_reply_spf_passes(message, command.sender)
     )
 
 
@@ -439,7 +455,14 @@ def resume_chat(server, thread):
 
 def resolve_chat(server, project_root, command):
     if command.thread_id:
-        thread = server.call("thread/read", {"threadId": command.thread_id, "includeTurns": False})["thread"]
+        try:
+            thread = server.call("thread/read", {"threadId": command.thread_id, "includeTurns": False})["thread"]
+        except RpcError as error:
+            if error.code == -32600 and error.detail in (
+                f"thread not loaded: {command.thread_id}", f"thread not found: {command.thread_id}",
+            ):
+                raise RejectedMail("未找到该本地 Codex 会话。请核对会话 ID。") from error
+            raise
         return resume_chat(server, thread)
     project = exactly_one(server.pages("project/list"), command.project, "项目")
     if project is None:
@@ -480,6 +503,7 @@ def submit_command(db, config, command, uid):
         return
 
     with connect_codex() as server:
+        queued = command.is_reply
         try:
             thread_id = resolve_chat(server, Path(config["project_root"]), command)
         except (BusyThread, RpcError) as error:
@@ -489,6 +513,7 @@ def submit_command(db, config, command, uid):
             if not command.thread_id or not occupied:
                 raise
             thread_id = command.thread_id
+            queued = True
         client_id = str(uuid5(NAMESPACE_URL, key))
         params = {
             "threadId": thread_id, "clientUserMessageId": client_id,
@@ -497,7 +522,7 @@ def submit_command(db, config, command, uid):
         # Persist the claim before the write RPC. A lost connection may hide a successful submit.
         with db:
             db.execute("INSERT INTO submissions VALUES (?, ?, NULL, ?)", (key, thread_id, "submitting"))
-            if command.thread_id:
+            if command.is_reply:
                 _, question = mail.split_mail_request(command.text)
                 protected = mail.windows_protect(question.encode("utf-8"), encrypt=True) if question else None
                 db.execute(
@@ -507,8 +532,8 @@ def submit_command(db, config, command, uid):
                      command.message_id, json.dumps(command.references), protected),
                 )
         try:
-            if command.thread_id:
-                # Queue replies even on an idle chat so they cannot steer someone else's active turn.
+            if queued:
+                # The current writer can dispatch this after the active turn.
                 server.call("thread/queue/add", params)
             else:
                 # Apply the workspace sandbox even when an existing chat used a broader policy.
@@ -518,10 +543,10 @@ def submit_command(db, config, command, uid):
         except RpcError:
             with db:
                 db.execute("DELETE FROM submissions WHERE message_key=?", (key,))
-                if command.thread_id:
+                if command.is_reply:
                     db.execute("DELETE FROM reply_notifications WHERE client_id=?", (client_id,))
             raise
-        if command.thread_id:
+        if queued:
             with db:
                 db.execute("UPDATE submissions SET status='queued' WHERE message_key=?", (key,))
             print(f"UID {uid} 已排队到 codex://threads/{thread_id}", flush=True)
