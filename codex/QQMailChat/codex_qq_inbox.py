@@ -25,7 +25,7 @@ from email.parser import BytesParser
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 
 DIRECTORY = Path(__file__).resolve().parent
@@ -253,12 +253,24 @@ def reply_text(text):
     return "\n".join(lines).strip()
 
 
-def parse_mail(raw, mailbox=None):
+def parse_mail(raw, mailbox=None, device_name=""):
     message = BytesParser(policy=policy.default).parsebytes(raw)
+    if str(message.get("Auto-Submitted", "no")).strip().casefold() != "no":
+        return None, message
     subject = str(message.get("Subject", "")).rstrip()
-    match = SUBJECT.fullmatch(subject)
-    could_be_reply = bool(mailbox and (mail.REPLY_PREFIX.match(subject) or message.get("In-Reply-To") or message.get("References")))
-    if not (match or could_be_reply) or str(message.get("Auto-Submitted", "no")).strip().casefold() != "no":
+    plain_subject, reply_prefixes = mail.REPLY_PREFIX.subn("", subject)
+    try:
+        target_device, command_subject = mail.split_subject_device(plain_subject)
+    except ValueError:
+        return None, message
+    if target_device and target_device != mail.normalize_device_name(device_name):
+        return None, message
+
+    has_parent = "In-Reply-To" in message
+    has_references = "References" in message
+    is_reply = bool(reply_prefixes or has_parent or has_references)
+    match = SUBJECT.fullmatch(command_subject) if not is_reply else None
+    if not (match or (is_reply and mailbox)):
         return None, message
     from_headers = message.get_all("From", [])
     addresses = from_headers[0].addresses if len(from_headers) == 1 else ()
@@ -271,7 +283,6 @@ def parse_mail(raw, mailbox=None):
     sender = addresses[0].addr_spec.casefold()
     workspace = chat = ""
     thread_id = None
-    is_reply = match is None
     rejection_reason = None
     in_reply_to = reply_ids(message, "In-Reply-To")
     references = reply_ids(message, "References")
@@ -291,8 +302,13 @@ def parse_mail(raw, mailbox=None):
             if not (workspace and chat):
                 rejection_reason = "邮件缺少有效的工作目录名或会话名。"
     else:
+        # Malformed reply headers must not turn a reply into a command or a subject fallback.
+        if (has_parent and not in_reply_to) or (not has_parent and has_references and not references):
+            return None, message
         try:
-            thread_id = mail.find_reply_chat(mailbox, sender, subject.strip(), in_reply_to, references)
+            thread_id = mail.find_reply_chat(
+                mailbox, sender, subject.strip(), in_reply_to, references, device_name=target_device,
+            )
         except ValueError as error:
             raise RejectedMail(str(error)) from error
         if thread_id is None:
@@ -409,7 +425,7 @@ def sent_folders(box):
     return names
 
 
-def sent_copy_matches(box, command, mailbox):
+def sent_copy_matches(box, command, mailbox, device_name=""):
     # A matching copy written to the authenticated account's Sent folder verifies self-mail.
     for name in sent_folders(box):
         if box.select(name, readonly=True)[0] != "OK":
@@ -420,7 +436,7 @@ def sent_copy_matches(box, command, mailbox):
                 raise imaplib.IMAP4.error("Cannot search Sent")
             for uid in reversed((data[0] or b"").split()[-8:]):
                 raw = read_message(box, int(uid))
-                if raw and parse_mail(raw, mailbox)[0] == command:
+                if raw and parse_mail(raw, mailbox, device_name)[0] == command:
                     return True
         finally:
             select_inbox(box)
@@ -432,7 +448,7 @@ def authenticated(box, config, command, message):
     if not command.is_reply and command.sender not in config["senders"]:
         return False
     if command.sender == config["mailbox"]:
-        return sent_copy_matches(box, command, config["mailbox"])
+        return sent_copy_matches(box, command, config["mailbox"], config.get("device_name", ""))
     # Standalone commands may use SPF only when that allowlisted address opted in.
     allow_spf = command.is_reply or command.sender in config.get("spf_senders", ())
     return qq_dmarc_passes(message, command.sender) or (allow_spf and qq_spf_passes(message, command.sender))
@@ -581,14 +597,15 @@ def submission_key(mailbox, message_id):
     return hashlib.sha256(f"{mailbox}\0{message_id}".encode()).hexdigest()
 
 
-def record_completion_reply(db, mailbox, command, thread_id, client_id, question):
+def record_completion_reply(db, config, command, thread_id, client_id, question):
     # Save only the authenticated sender, mail headers, and the encrypted question.
     protected = mail.windows_protect(question.encode("utf-8"), encrypt=True) if question else None
+    subject = mail.with_device_name(command.subject, config.get("device_name", ""))
     db.execute(
         "INSERT INTO reply_notifications (client_id, mailbox, thread_id, recipient, subject, "
-        "parent_id, refs, question) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (client_id, mailbox, thread_id, command.sender, command.subject,
-         command.message_id, json.dumps(command.references), protected),
+        "parent_id, refs, question, reply_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (client_id, config["mailbox"], thread_id, command.sender, subject,
+         command.message_id, json.dumps(command.references), protected, str(uuid4())),
     )
 
 
@@ -622,7 +639,7 @@ def submit_command(db, config, command, uid):
         # Record the reply envelope before submitting. A fast turn can finish before the RPC returns.
         with db:
             db.execute("INSERT INTO submissions VALUES (?, ?, NULL, ?)", (key, thread_id, "submitting"))
-            record_completion_reply(db, config["mailbox"], command, thread_id, client_id, question)
+            record_completion_reply(db, config, command, thread_id, client_id, question)
         try:
             if not queued:
                 try:
@@ -693,20 +710,21 @@ def submit_or_record_failure(db, config, command, uid):
         with db:
             if not db.execute("INSERT OR IGNORE INTO submissions VALUES (?, NULL, NULL, 'rejected')", (key,)).rowcount:
                 return
+            subject = mail.with_device_name(command.subject, config.get("device_name", ""))
             db.execute(
-                "INSERT INTO failed_replies (client_id, mailbox, recipient, subject, parent_id, refs, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid5(NAMESPACE_URL, key)), config["mailbox"], command.sender, command.subject,
-                 command.message_id, json.dumps(command.references), reason),
+                "INSERT INTO failed_replies (client_id, mailbox, recipient, subject, parent_id, refs, reason, reply_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid5(NAMESPACE_URL, key)), config["mailbox"], command.sender, subject,
+                 command.message_id, json.dumps(command.references), reason, str(uuid4())),
             )
         print(f"UID {uid} 已登记失败回执。{reason}", flush=True)
 
 
-def send_queued_reply(client_id, recipient, subject, parent_id, refs, body, *, thread_id=None):
+def send_queued_reply(reply_id, recipient, subject, parent_id, refs, body, *, thread_id=None):
     try:
         mail.send_notice(
             test=False, recipient=recipient, subject=subject, thread_id=thread_id,
-            body=body, reply=(parent_id, json.loads(refs), client_id),
+            body=body, reply=(parent_id, json.loads(refs), reply_id),
         )
     except mail.ReplyDeliveryUncertain:
         # A disconnect during SMTP DATA may have hidden a successful delivery.
@@ -720,14 +738,14 @@ def send_queued_reply(client_id, recipient, subject, parent_id, refs, body, *, t
 
 def deliver_failed_replies(db, mailbox):
     rows = db.execute(
-        "SELECT client_id, recipient, subject, parent_id, refs, reason FROM failed_replies "
+        "SELECT client_id, recipient, subject, parent_id, refs, reason, COALESCE(reply_id, client_id) FROM failed_replies "
         "WHERE mailbox=? AND status='pending' ORDER BY rowid", (mailbox,),
     ).fetchall()
-    for client_id, recipient, subject, parent_id, refs, reason in rows:
+    for client_id, recipient, subject, parent_id, refs, reason, reply_id in rows:
         with db:
             db.execute("UPDATE failed_replies SET status='sending' WHERE client_id=?", (client_id,))
         body = f"这封邮件中的指令未能提交给 Codex。\n\n原因\n{reason}\n"
-        status = send_queued_reply(client_id, recipient, subject, parent_id, refs, body)
+        status = send_queued_reply(reply_id, recipient, subject, parent_id, refs, body)
         with db:
             db.execute("UPDATE failed_replies SET status=? WHERE client_id=?", (status, client_id))
         if status == "sent":
@@ -735,7 +753,7 @@ def deliver_failed_replies(db, mailbox):
 
 
 def deliver_reply(db, entry, conclusion):
-    client_id, thread_id, recipient, subject, parent_id, refs, protected_question = entry
+    client_id, thread_id, recipient, subject, parent_id, refs, protected_question, reply_id = entry
     try:
         question = mail.windows_protect(protected_question, encrypt=False).decode("utf-8") if protected_question else ""
     except (OSError, UnicodeError) as error:
@@ -744,7 +762,7 @@ def deliver_reply(db, entry, conclusion):
     with db:
         db.execute("UPDATE reply_notifications SET status='sending' WHERE client_id=?", (client_id,))
     body = mail.notice_body(question, conclusion)
-    status = send_queued_reply(client_id, recipient, subject, parent_id, refs, body, thread_id=thread_id)
+    status = send_queued_reply(reply_id, recipient, subject, parent_id, refs, body, thread_id=thread_id)
     with db:
         db.execute("UPDATE reply_notifications SET status=?, question=? WHERE client_id=?", (
             status, protected_question if status == "pending" else None, client_id,
@@ -755,7 +773,7 @@ def deliver_reply(db, entry, conclusion):
 
 def deliver_completed_replies(db, mailbox):
     rows = db.execute(
-        "SELECT client_id, thread_id, recipient, subject, parent_id, refs, question "
+        "SELECT client_id, thread_id, recipient, subject, parent_id, refs, question, COALESCE(reply_id, client_id) "
         "FROM reply_notifications WHERE mailbox=? AND status='pending' ORDER BY rowid", (mailbox,),
     ).fetchall()
     state = mail.latest_state_db() if rows else None
@@ -825,7 +843,7 @@ def poll(db, config):
             try:
                 raw = read_message(box, uid)
                 if raw:
-                    command, message = parse_mail(raw, config["mailbox"])
+                    command, message = parse_mail(raw, config["mailbox"], config.get("device_name", ""))
                     if command:
                         if not authenticated(box, config, command, message):
                             raise RejectedMail("发件身份验证未通过。")
@@ -855,6 +873,7 @@ def setup():
     if not sys.stdin.isatty():
         raise ValueError("请在本机 PowerShell 或 Windows 终端运行 setup。")
     outgoing = json.loads(mail.SETTINGS.read_text(encoding="utf-8-sig")) if mail.SETTINGS.is_file() else {}
+    previous = json.loads(CONFIG.read_text(encoding="utf-8-sig")) if CONFIG.is_file() else {}
     default_mailbox = outgoing.get("sender", "")
     mailbox = mail.email_address(input(f"接收指令的 QQ 邮箱 [{default_mailbox}]：").strip() or default_mailbox).casefold()
     source = input("允许发指令的邮箱（逗号分隔，回车仅允许此 QQ 邮箱本人）：").strip()
@@ -862,6 +881,8 @@ def setup():
     root = Path(input(f"新项目存放目录 [{PROJECT_ROOT}]：").strip().strip('"') or PROJECT_ROOT)
     if not root.is_absolute():
         raise ValueError("新项目存放目录需要是绝对路径。")
+    default_name = previous.get("device_name", "")
+    name = mail.normalize_device_name(input(f"本机设备名（可选） [{default_name}]：").strip() or default_name)
     reusable = outgoing.get("protected_code") if mailbox == default_mailbox.casefold() else None
     suffix = "，回车复用发信授权码" if reusable else ""
     code = "".join(getpass.getpass(f"QQ 邮箱 IMAP 授权码（输入不可见{suffix}）：").split())
@@ -871,8 +892,9 @@ def setup():
         protected = base64.b64encode(mail.windows_protect(code.encode("ascii"), encrypt=True)).decode("ascii")
     else:
         raise ValueError("请输入 QQ 邮箱 IMAP 授权码。")
-    previous = json.loads(CONFIG.read_text(encoding="utf-8-sig")) if CONFIG.is_file() else {}
     settings = {"mailbox": mailbox, "senders": senders, "project_root": str(root), "protected_code": protected}
+    if name:
+        settings["device_name"] = name
     # Retain SPF opt-ins only for addresses still allowed on this same mailbox.
     if previous.get("mailbox", "").casefold() == mailbox:
         retained = sorted(set(previous.get("spf_senders", ())).intersection(senders))
@@ -886,12 +908,30 @@ def setup():
     print("收信授权码已加密保存。运行 check 验证连接，再运行 run。")
 
 
+def show_device(config):
+    name = config.get("device_name") or "未设置"
+    print(f"本机设备名：{name}。配置文件：{CONFIG}", flush=True)
+
+
+def set_device_name(value):
+    name = mail.normalize_device_name(value)
+    with listener_lock():
+        config = json.loads(CONFIG.read_text(encoding="utf-8-sig"))
+        if name:
+            config["device_name"] = name
+        else:
+            config.pop("device_name", None)
+        mail.write_json(CONFIG, config)
+    show_device(config)
+
+
 def run(config):
     with listener_lock(), closing(sqlite3.connect(mail.INBOX_STATE)) as db:
         init_state(db)
         with db:
             db.execute("UPDATE reply_notifications SET status='uncertain', question=NULL WHERE status='sending'")
             db.execute("UPDATE failed_replies SET status='uncertain' WHERE status='sending'")
+        show_device(config)
         print("QQ 收信程序正在运行。按 Ctrl+C 停止。", flush=True)
         while True:
             try:
@@ -919,29 +959,42 @@ def init_state(db):
         CREATE TABLE IF NOT EXISTS reply_notifications (
             client_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, thread_id TEXT NOT NULL, recipient TEXT NOT NULL,
             subject TEXT NOT NULL, parent_id TEXT NOT NULL, refs TEXT NOT NULL, question BLOB,
-            status TEXT NOT NULL DEFAULT 'pending'
+            status TEXT NOT NULL DEFAULT 'pending', reply_id TEXT
         );
         CREATE INDEX IF NOT EXISTS inbox_reply_recipient ON reply_notifications(thread_id, recipient);
         CREATE INDEX IF NOT EXISTS inbox_pending_reply ON reply_notifications(mailbox, status);
         CREATE TABLE IF NOT EXISTS failed_replies (
             client_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, recipient TEXT NOT NULL,
             subject TEXT NOT NULL, parent_id TEXT NOT NULL, refs TEXT NOT NULL, reason TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
+            status TEXT NOT NULL DEFAULT 'pending', reply_id TEXT
         );
         CREATE INDEX IF NOT EXISTS inbox_pending_failure ON failed_replies(mailbox, status);
     """)
+    # A queued reply from an older version keeps its existing SMTP identifier.
+    for table in ("reply_notifications", "failed_replies"):
+        columns = {column[1] for column in db.execute(f"PRAGMA table_info({table})")}
+        if "reply_id" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN reply_id TEXT")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("setup", "check", "run"))
-    action = parser.parse_args().action
+    actions = parser.add_subparsers(dest="action", required=True)
+    for action in ("setup", "check", "run"):
+        actions.add_parser(action)
+    route = actions.add_parser("route", help="Set the local device name used in email subjects.")
+    route.add_argument("--device-name", required=True, help="Name without brackets. Supply an empty value to clear it.")
+    options = parser.parse_args()
     try:
-        if action == "setup":
+        if options.action == "setup":
             setup()
+        elif options.action == "route":
+            set_device_name(options.device_name)
         else:
             config = json.loads(CONFIG.read_text(encoding="utf-8-sig"))
-            if action == "check":
+            config["device_name"] = mail.normalize_device_name(config.get("device_name", ""))
+            if options.action == "check":
+                show_device(config)
                 with inbox_connection(config) as box:
                     print("QQ IMAP 登录成功。")
                     if config["mailbox"] in config["senders"] and not sent_folders(box):

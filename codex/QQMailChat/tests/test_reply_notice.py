@@ -23,7 +23,7 @@ mail = inbox.mail
 THREAD = "01234567-89ab-4def-8123-456789abcdef"
 SENDER = "author@example.com"
 MAILBOX = "bot@example.com"
-ROOT_ID = "<original@example.com>"
+ROOT_ID = "<original.0123456789abcdef01234567@example.com>"
 PARENT_ID = "<reply@example.com>"
 SUBJECT = "[完成通知][测试项目][测试会话][续聊码 0123456789abcdef01234567]"
 
@@ -31,6 +31,7 @@ SUBJECT = "[完成通知][测试项目][测试会话][续聊码 0123456789abcdef
 class ReplyNotificationTest(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.multiple(inbox, DIRECTORY=root, CONFIG=root / "inbox-settings.json"))
         self.enterContext(patch.multiple(
             mail, CODEX_PROFILE=root, INBOX_STATE=root / "inbox-state.sqlite3",
             SETTINGS=root / "settings.json", TURN_NOTICES=root / "turn-notices.sqlite3",
@@ -48,7 +49,7 @@ class ReplyNotificationTest(unittest.TestCase):
         self.enterContext(patch.object(mail, "windows_protect", side_effect=lambda data, **_: data))
         self.config = {"mailbox": MAILBOX, "project_root": str(root)}
 
-    def raw_email(self, subject, body, *, in_reply_to=None, message_id=PARENT_ID, sender=SENDER):
+    def raw_email(self, subject, body, *, in_reply_to=None, references=None, message_id=PARENT_ID, sender=SENDER):
         message = EmailMessage()
         message["From"] = sender
         message["To"] = MAILBOX
@@ -56,11 +57,14 @@ class ReplyNotificationTest(unittest.TestCase):
         message["Message-ID"] = message_id
         if in_reply_to:
             message["In-Reply-To"] = in_reply_to
+        if references:
+            message["References"] = references
         message.set_content(body)
         return message.as_bytes()
 
-    def command_email(self, subject, body, *, in_reply_to=None):
-        return inbox.parse_mail(self.raw_email(subject, body, in_reply_to=in_reply_to), MAILBOX)
+    def command_email(self, subject, body, *, in_reply_to=None, references=None, device_name=""):
+        raw = self.raw_email(subject, body, in_reply_to=in_reply_to, references=references)
+        return inbox.parse_mail(raw, MAILBOX, device_name=device_name)
 
     def command(self):
         command, _ = self.command_email("回复：" + SUBJECT, "请继续。\n> 上一轮正文", in_reply_to=ROOT_ID)
@@ -392,8 +396,8 @@ class ReplyNotificationTest(unittest.TestCase):
         self.assertEqual(connect.call_count, 2)
 
     def test_explicit_id_does_not_inherit_reply_permissions(self):
-        # A reply header on an explicit-ID command cannot bypass its normal sender checks.
-        command, message = self.command_email(f"[AI会话][{THREAD}]", "请继续。", in_reply_to=ROOT_ID)
+        command, message = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
+        self.assertFalse(command.is_reply)
         with (patch.object(inbox, "qq_dmarc_passes", return_value=True) as dmarc,
               patch.object(inbox, "qq_spf_passes", return_value=True) as spf):
             disallowed = {**self.config, "senders": [MAILBOX], "spf_senders": [SENDER]}
@@ -405,6 +409,14 @@ class ReplyNotificationTest(unittest.TestCase):
             spf.assert_not_called()
             self.assertTrue(inbox.authenticated(None, {**allowed, "spf_senders": [SENDER]}, command, message))
             spf.assert_called_once_with(message, SENDER)
+
+    def test_command_subject_with_reply_headers_can_only_resume_registered_thread(self):
+        other = "12345678-89ab-4def-8123-456789abcdef"
+        command, _ = self.command_email(f"[AI会话][{other}]", "继续。\n> 原来的任务。", in_reply_to=ROOT_ID)
+        self.assertTrue(command.is_reply)
+        self.assertEqual((command.thread_id, command.text), (THREAD, "继续。"))
+        unresolved, _ = self.command_email(f"[AI会话][{other}]", "继续。", in_reply_to="<unknown@example.com>")
+        self.assertIsNone(unresolved)
 
     def test_subject_formats_default_names_to_global_and_keep_full_ids(self):
         command, _ = self.command_email("[AI会话][测试项目][测试会话]", "请继续。")
@@ -423,6 +435,169 @@ class ReplyNotificationTest(unittest.TestCase):
         invalid, _ = self.command_email("[AIChat][]", "请继续。")
         self.assertIn("缺少有效的会话名", invalid.rejection_reason)
 
+    def test_device_subjects_preserve_name_and_id_formats(self):
+        cases = (
+            ("[OFFICE-PC][AICHAT][构建排查]", "office-pc", ("Global", "构建排查", None)),
+            ("[办公室][AI会话][工具][构建排查]", "办公室", ("工具", "构建排查", None)),
+            (f"[office-pc][AI会话][{THREAD.upper()}]", "office-pc", ("", "", THREAD)),
+            ("[AICHAT][AICHAT][构建排查]", "office-pc", ("AICHAT", "构建排查", None)),
+            ("[office-pc][AICHAT][构建排查]", "", None),
+            ("[office-pc][AICHAT][构建排查]", "home-pc", None),
+            ("[-office][AICHAT][构建排查]", "office-pc", None),
+        )
+        for subject, device_name, expected in cases:
+            with self.subTest(subject=subject, device_name=device_name):
+                command, _ = self.command_email(subject, "请继续。", device_name=device_name)
+                parsed = (command.workspace, command.chat, command.thread_id) if command else None
+                self.assertEqual(parsed, expected)
+
+    def test_two_listeners_keep_separate_cursors_and_process_only_matching_or_unaddressed_mail(self):
+        messages = {
+            1: self.raw_email("[OFFICE-PC][AICHAT][构建排查]", "办公室任务。"),
+            2: self.raw_email("[home-pc][AI会话][构建排查]", "家里任务。", message_id="<home@example.com>"),
+            3: self.raw_email("[AICHAT][构建排查]", "两台都处理。", message_id="<shared@example.com>"),
+            4: self.raw_email("[office-pc][AICHAT][构建排查]", "未授权。",
+                              sender="unknown@example.com", message_id="<unknown@example.com>"),
+        }
+        messages[5] = messages[3]
+        box = Mock()
+        box.response.return_value = ("UIDVALIDITY", [b"42"])
+        box.uid.return_value = ("OK", [b"1 2 3 4 5"])
+        for name, targets in (("office-pc", ["办公室任务。", "两台都处理。"]),
+                              ("home-pc", ["家里任务。", "两台都处理。"])):
+            with (self.subTest(name=name), contextlib.closing(sqlite3.connect(":memory:")) as db,
+                  patch.object(inbox, "inbox_connection", return_value=contextlib.nullcontext(box)),
+                  patch.object(inbox, "read_message", side_effect=lambda _, uid: messages[uid]),
+                  patch.object(inbox, "qq_dmarc_passes", return_value=True),
+                  patch.object(inbox, "connect_codex") as connect,
+                  patch.object(inbox, "resolve_chat", side_effect=inbox.BusyThread(THREAD)),
+                  contextlib.redirect_stdout(io.StringIO())):
+                inbox.init_state(db)
+                inbox.checkpoint(db, MAILBOX, 42, 0)
+                config = {**self.config, "senders": [SENDER], "device_name": name}
+                inbox.poll(db, config)
+                inbox.poll(db, config)
+                server = connect.return_value.__enter__.return_value
+                self.assertEqual([request.args[1]["input"][0]["text"] for request in server.call.call_args_list], targets)
+                self.assertEqual(db.execute("SELECT last_uid FROM checkpoint").fetchone(), (5,))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM failed_replies").fetchone(), (0,))
+
+    def test_device_prefixed_self_mail_uses_matching_sent_copy(self):
+        raw = self.raw_email("[office-pc][AICHAT][构建排查]", "请继续。", sender=MAILBOX)
+        wrong = self.raw_email("[home-pc][AICHAT][构建排查]", "请继续。", sender=MAILBOX)
+        command, message = inbox.parse_mail(raw, MAILBOX, device_name="office-pc")
+        config = {**self.config, "senders": [MAILBOX], "device_name": "office-pc"}
+        box = Mock()
+        box.list.return_value = ("OK", [b'(\\Sent) "/" "Sent"'])
+        box.select.return_value = ("OK", [])
+        box.uid.return_value = ("OK", [b"51"])
+        with patch.object(inbox, "read_message", side_effect=[raw, wrong]):
+            self.assertTrue(inbox.authenticated(box, config, command, message))
+            self.assertFalse(inbox.authenticated(box, config, command, message))
+        self.assertEqual(box.select.call_args_list, [
+            call(b'"Sent"', readonly=True), call("INBOX", readonly=True),
+            call(b'"Sent"', readonly=True), call("INBOX", readonly=True),
+        ])
+
+    def test_device_reply_requires_matching_local_route_and_prioritizes_direct_parent(self):
+        tagged = "[office-pc]" + SUBJECT
+        lookalike = tagged.replace("0123456789abcdef01234567", "abcdef0123456789abcdef01")
+        mail.remember_reply_route(PARENT_ID, MAILBOX, SENDER, tagged, THREAD)
+        mail.remember_reply_route("<lookalike@example.com>", MAILBOX, SENDER, lookalike, THREAD)
+        cases = (
+            (tagged, "office-pc", PARENT_ID, None, True),
+            (tagged, "office-pc", None, PARENT_ID, True),
+            (tagged, "office-pc", None, None, True),
+            (tagged, "office-pc", "<unknown@example.com>", PARENT_ID, False),
+            (tagged, "office-pc", "invalid message id", None, False),
+            (tagged, "office-pc", None, "invalid message id", False),
+            (tagged, "office-pc", ROOT_ID, PARENT_ID, False),
+            (tagged, "home-pc", PARENT_ID, None, False),
+            (tagged, "", PARENT_ID, None, False),
+            (SUBJECT, "office-pc", ROOT_ID, None, True),
+            (lookalike, "office-pc", None, None, False),
+        )
+        for subject, name, direct, references, expected in cases:
+            with self.subTest(subject=subject, device=name, direct=direct, references=references):
+                reply, _ = self.command_email("Re: " + subject, "请继续。", in_reply_to=direct,
+                                              references=references, device_name=name)
+                self.assertEqual(reply.thread_id if reply else None, THREAD if expected else None)
+
+    def test_unaddressed_command_creates_distinct_device_reply_ids_stable_across_retries(self):
+        subject = "[AICHAT][构建排查]"
+        command, _ = self.command_email(subject, "请开始。")
+        with (patch.object(mail.smtplib, "SMTP_SSL") as connection,
+              patch.object(inbox, "connect_codex"),
+              patch.object(inbox, "resolve_chat", side_effect=inbox.BusyThread(THREAD)),
+              contextlib.redirect_stdout(io.StringIO())):
+            smtp = connection.return_value.__enter__.return_value
+            smtp.send_message.side_effect = [mail.smtplib.SMTPDataError(451, b"Try again"), {}, {}, {}]
+            for name in ("office-pc", "home-pc"):
+                with contextlib.closing(sqlite3.connect(":memory:")) as db:
+                    inbox.init_state(db)
+                    inbox.submit_command(db, {**self.config, "device_name": name}, command, 1)
+                    client_id, = db.execute("SELECT client_id FROM reply_notifications").fetchone()
+                    self.transcript.write_text("", encoding="utf-8")
+                    self.record_turn(client_id)
+                    self.append(type="task_complete", turn_id="reply-turn", last_agent_message="已完成。")
+                    inbox.deliver_completed_replies(db, MAILBOX)
+                    inbox.deliver_completed_replies(db, MAILBOX)
+            attempts = [request.args[0] for request in smtp.send_message.call_args_list]
+        self.assertEqual([str(reply["Subject"]) for reply in attempts], [
+            f"Re: [office-pc]{subject}", f"Re: [office-pc]{subject}", f"Re: [home-pc]{subject}",
+        ])
+        self.assertEqual([str(reply["In-Reply-To"]) for reply in attempts], [PARENT_ID] * 3)
+        self.assertEqual(str(attempts[0]["Message-ID"]), str(attempts[1]["Message-ID"]))
+        self.assertNotEqual(str(attempts[1]["Message-ID"]), str(attempts[2]["Message-ID"]))
+
+    def test_route_sets_device_name_without_credentials_and_setup_keeps_it(self):
+        original = {**self.config, "protected_code": "YQ==", "senders": [MAILBOX], "spf_senders": [MAILBOX]}
+        mail.write_json(inbox.CONFIG, original)
+        args = ["codex_qq_inbox.py", "route", "--device-name", "办公室"]
+        with (patch.object(inbox.sys, "argv", args), patch.object(inbox.getpass, "getpass") as ask_code,
+              patch.object(inbox, "inbox_connection") as connect, contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(inbox.main(), 0)
+            ask_code.assert_not_called()
+            connect.assert_not_called()
+        updated = {**original, "device_name": "办公室"}
+        self.assertEqual(json.loads(inbox.CONFIG.read_text(encoding="utf-8")), updated)
+        with (patch.object(inbox.sys.stdin, "isatty", return_value=True),
+              patch("builtins.input", side_effect=lambda prompt: original["project_root"] if "新项目" in prompt else ""),
+              patch.object(inbox.getpass, "getpass", return_value=""), contextlib.redirect_stdout(io.StringIO())):
+            inbox.setup()
+        self.assertEqual(json.loads(inbox.CONFIG.read_text(encoding="utf-8")), updated)
+
+    def test_legacy_pending_replies_keep_their_message_ids_after_migration(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.executescript("""
+                CREATE TABLE reply_notifications (
+                    client_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, thread_id TEXT NOT NULL, recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL, parent_id TEXT NOT NULL, refs TEXT NOT NULL, question BLOB,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                );
+                CREATE TABLE failed_replies (
+                    client_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL, parent_id TEXT NOT NULL, refs TEXT NOT NULL, reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                );
+            """)
+            with db:
+                db.execute("INSERT INTO reply_notifications VALUES (?, ?, ?, ?, ?, ?, '[]', NULL, 'pending')",
+                           ("legacy-complete", MAILBOX, THREAD, SENDER, SUBJECT, PARENT_ID))
+                db.execute("INSERT INTO failed_replies VALUES (?, ?, ?, ?, ?, '[]', ?, 'pending')",
+                           ("legacy-failed", MAILBOX, SENDER, "[AI会话][原任务]", PARENT_ID, "会话不存在。"))
+            inbox.init_state(db)
+            inbox.init_state(db)
+            self.record_turn("legacy-complete")
+            self.append(type="task_complete", turn_id="reply-turn", last_agent_message="已完成。")
+            with patch.object(mail.smtplib, "SMTP_SSL") as connection, contextlib.redirect_stdout(io.StringIO()):
+                smtp = connection.return_value.__enter__.return_value
+                inbox.deliver_completed_replies(db, MAILBOX)
+                inbox.deliver_failed_replies(db, MAILBOX)
+        self.assertEqual([str(request.args[0]["Message-ID"]) for request in smtp.send_message.call_args_list], [
+            "<codex-qqmailchat.legacy-complete@example.com>", "<codex-qqmailchat.legacy-failed@example.com>",
+        ])
+
     def test_missing_id_is_rejected_without_attempting_to_resume_or_create(self):
         command, _ = self.command_email(f"[AI会话][{THREAD}]", "请继续。")
         server = Mock()
@@ -438,7 +613,7 @@ class ReplyNotificationTest(unittest.TestCase):
         by_name = "[AI会话][测试项目][测试会话]"
         named_id, malformed_id = "<named@example.com>", "<malformed@example.com>"
         messages = {
-            1: self.raw_email(by_id, "测试找不到的会话。", in_reply_to=ROOT_ID),
+            1: self.raw_email(by_id, "测试找不到的会话。"),
             2: self.raw_email(by_name, "测试重名的会话。", message_id=named_id),
             3: self.raw_email("[AIChat][]", "测试空会话名。", message_id=malformed_id),
             4: self.raw_email(by_id, "未授权。", sender="unknown@example.com", message_id="<unknown@example.com>"),
@@ -489,7 +664,7 @@ class ReplyNotificationTest(unittest.TestCase):
             self.assertIn(explanation, response.get_body(("plain",)).get_content())
             self.assertIn(explanation, response.get_body(("html",)).get_content())
             self.assertIsNone(inbox.parse_mail(response.as_bytes(), MAILBOX)[0])
-        self.assertEqual(str(replies[PARENT_ID]["References"]), f"{ROOT_ID} {PARENT_ID}")
+        self.assertEqual(str(replies[PARENT_ID]["References"]), PARENT_ID)
         self.assertFalse(mail.find_reply_chat(MAILBOX, SENDER, "", (str(replies[PARENT_ID]["Message-ID"]),), ()))
 
     def test_busy_rpc_is_retried_without_a_failure_receipt(self):
@@ -553,7 +728,7 @@ class ReplyNotificationTest(unittest.TestCase):
 class NoticeProjectNameTest(unittest.TestCase):
     def setUp(self):
         profile = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.enterContext(patch.object(mail, "CODEX_PROFILE", profile))
+        self.enterContext(patch.multiple(mail, CODEX_PROFILE=profile, SETTINGS=profile / "settings.json"))
         self.db = self.enterContext(contextlib.closing(sqlite3.connect(profile / "state_5.sqlite")))
         self.db.executescript("""
             CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, project_id TEXT, cwd TEXT);
@@ -571,6 +746,11 @@ class NoticeProjectNameTest(unittest.TestCase):
     def test_subject_uses_unique_workspace_project_for_legacy_chat(self):
         subject, _ = mail.notice_content(self.event, "测试问题")
         self.assertEqual(subject, "[完成通知][工具工程][测试会话]")
+
+    def test_notice_subject_reads_the_configured_device_name(self):
+        mail.write_json(mail.SETTINGS.with_name("inbox-settings.json"), {"device_name": "办公室"})
+        subject, _ = mail.notice_content(self.event, "测试问题")
+        self.assertEqual(subject, "[办公室][完成通知][工具工程][测试会话]")
 
     def test_registered_workspace_name_beats_explicit_assignment(self):
         with self.db:

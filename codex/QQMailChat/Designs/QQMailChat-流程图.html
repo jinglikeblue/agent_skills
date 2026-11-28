@@ -43,6 +43,14 @@
     nav { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 14px; }
     .section-title { margin: 0 0 9px 2px; }
 
+    .setup { margin-bottom: 18px; }
+    .setup-flow {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .setup-flow .node { background: #fff; }
+
     .mail-flow, .hook-flow {
       display: grid;
       grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.42fr) minmax(0, 0.92fr);
@@ -199,7 +207,7 @@
       #delivery, #prompt-hook { grid-column: 1 / -1; }
     }
     @media (max-width: 720px) {
-      .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
+      .setup-flow, .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 500px) {
       main { padding-block: 12px 16px; }
@@ -213,7 +221,7 @@
       main { padding: 0; }
       nav { display: none; }
       .phase { break-inside: avoid; }
-      .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
+      .setup-flow, .mail-flow, .hook-flow { grid-template-columns: minmax(0, 1fr); }
     }
   </style>
 </head>
@@ -222,35 +230,78 @@
     <header class="page-header">
       <h1>QQMailChat UML 活动图</h1>
       <nav aria-label="流程导航">
+        <a href="#device-setup">设备名设置</a>
         <a href="#email">邮件发起与续聊</a>
         <a href="#notice">Codex 完成通知</a>
       </nav>
     </header>
+
+    <section id="device-setup" class="setup" aria-labelledby="device-setup-title">
+      <h2 id="device-setup-title" class="section-title">在每台电脑上设置设备名</h2>
+      <div class="setup-flow">
+        <div class="node initial">
+          <strong>通过命令行配置收信</strong>
+          <p>运行收信 <code>setup</code>，按提示填写本机设备名。已有名称时回车保留。</p>
+        </div>
+        <div class="node initial">
+          <strong>已配置邮箱或需要更名</strong>
+          <p>在本机停止监听，运行 <code>codex_qq_inbox.py route --device-name office-pc</code>。凭据弹窗用于设置邮箱和授权码。</p>
+        </div>
+        <div class="node outcome">
+          <strong>检查名称，再启动监听</strong>
+          <p><code>check</code> 显示设备名和配置路径。每台电脑使用不同的名称，然后运行 <code>run</code>。</p>
+        </div>
+      </div>
+    </section>
 
     <!-- The links between stages identify where each branch continues. -->
     <section id="email" aria-labelledby="email-title">
       <h2 id="email-title" class="section-title">邮件发起与续聊</h2>
       <div class="mail-flow">
         <section id="intake" class="phase" aria-labelledby="intake-title">
-          <h3 id="intake-title">收信与校验 <span>QQ IMAP</span></h3>
+          <h3 id="intake-title">收信、分流与校验 <span>QQ IMAP</span></h3>
           <div class="flow">
             <div class="node initial">
               <strong>监听 QQ 收件箱</strong>
-              <p>每轮先尝试投递待发回信，再读取收件箱。首次运行或 UIDVALIDITY 变化时建立收件起点，之后只检查起点后的新邮件。</p>
+              <p>每轮先尝试投递待发回信，再只读扫描收件箱。首次运行或 UIDVALIDITY 变化时建立本机收件起点。</p>
             </div>
             <div class="arrow" aria-hidden="true"></div>
             <div class="node decision">
-              <strong>是指令邮件或可关联的人工回复？</strong>
-              <span class="exit">否 → 跳过自动邮件、无关邮件、邮件头无效或无法关联的回复。</span>
+              <strong>是主动指令或人工回复？</strong>
+              <p>识别指令主题及回复前缀或邮件头。</p>
+              <span class="exit">否 → 跳过自动邮件和无关邮件。</span>
             </div>
             <div class="arrow label">是</div>
+            <div class="node decision">
+              <strong>主题指定了设备？</strong>
+              <span class="exit">名称无效或与本机不匹配 → 跳过，不发回执。</span>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="fork">
+              <div class="branch">
+                <strong>名称匹配本机</strong>
+                <p><code>[office-pc][AICHAT][构建排查]</code> 只进入同名设备的处理流程。</p>
+              </div>
+              <div class="branch">
+                <strong>省略设备名</strong>
+                <p>主动指令由各台监听器独立处理。直接回复仍需关联本机记录。</p>
+              </div>
+            </div>
+            <div class="join" aria-hidden="true"></div>
+            <div class="arrow" aria-hidden="true"></div>
+            <div class="node">
+              <strong>解析指令或关联回复</strong>
+              <p>主动指令解析会话目标。直接回复须关联到本机的一条会话。</p>
+              <span class="exit">无法关联的回复 → 跳过。</span>
+            </div>
+            <div class="arrow" aria-hidden="true"></div>
             <div class="node decision">
               <strong>发件人通过身份校验？</strong>
               <span class="exit">否 → 记录并跳过。</span>
             </div>
             <div class="arrow label">是</div>
             <div class="node decision">
-              <strong>该邮箱下的 Message-ID 已登记过？</strong>
+              <strong>本机已登记该邮箱下的 Message-ID？</strong>
               <span class="exit">是 → 跳过重复提交，含上次提交结果未知的邮件。</span>
             </div>
             <div class="arrow label">否</div>
@@ -260,7 +311,7 @@
             <summary>身份校验规则</summary>
             <p>主动指令要求发件人在允许列表内，直接回复要求来自原通知或原回信的收件地址。QQ 自发自收检查「已发送」副本。外部地址采用 QQ 的 DMARC 校验，已关联的回复或显式启用了 SPF 的允许地址也可通过 QQ 的 SPF 校验。</p>
           </details>
-          <p class="note">处理或跳过邮件后保存 UID。暂时故障会保留收件进度，约 30 秒后进入下一轮。</p>
+          <p class="note">处理或跳过邮件后保存本机 UID，其他设备仍可读取。每台设备应使用独立名称，重名设备都可能执行同一封指令。暂时故障会保留收件进度，约 30 秒后进入下一轮。</p>
         </section>
 
         <section id="routing" class="phase" aria-labelledby="routing-title">
@@ -282,7 +333,7 @@
               </div>
               <div class="branch">
                 <strong>直接回复</strong>
-                <p>依次查 <code>In-Reply-To</code>、<code>References</code> 和原主题，仅提交新增正文。</p>
+                <p>优先查本机登记的 <code>In-Reply-To</code>。缺少时查 <code>References</code>，两者均缺失时凭带已登记续聊码的完整主题查找。仅提交新增正文。</p>
               </div>
             </div>
             <div class="join three" aria-hidden="true"></div>
@@ -334,7 +385,7 @@
             <div class="arrow" aria-hidden="true"></div>
             <div class="node">
               <strong>给原发件人发送线程回信</strong>
-              <p>沿用 <code>Re:</code> 主题和邮件回复头。</p>
+              <p>保留邮件回复头。已设置设备名时，回信主题如 <code>Re: [office-pc][AICHAT][构建排查]</code>。每封回信有独立 <code>Message-ID</code>，重试沿用已登记的值。</p>
             </div>
             <div class="arrow" aria-hidden="true"></div>
             <div class="node decision"><strong>SMTP 投递结果如何？</strong></div>
@@ -418,7 +469,7 @@
           <div class="flow">
             <div class="node">
               <strong>组装本轮问题和最终答复</strong>
-              <p>主题通常为 <code>[完成通知][工作目录名][会话名][续聊码 …]</code>。工作目录名优先用唯一匹配的侧栏显示名，其次用文件夹名。</p>
+              <p>主题格式为 <code>[完成通知][工作目录名][会话名][续聊码 …]</code>。已设置设备名时，在主题前加 <code>[office-pc]</code>。工作目录名优先用唯一匹配的侧栏显示名，其次用文件夹名。</p>
             </div>
             <div class="arrow" aria-hidden="true"></div>
             <div class="node outcome">

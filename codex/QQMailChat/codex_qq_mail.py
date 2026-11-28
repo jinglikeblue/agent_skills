@@ -25,6 +25,7 @@ from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path, PureWindowsPath
+from unicodedata import name as unicode_name
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
@@ -43,6 +44,11 @@ INBOX_STATE = SETTINGS.with_name("inbox-state.sqlite3")
 UUID_TEXT = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 ROLLOUT_NAME = re.compile(rf"rollout-.+?-({UUID_TEXT})(?:_{UUID_TEXT})?\.jsonl", re.IGNORECASE)
 REPLY_PREFIX = re.compile(r"^(?:(?:re|回复)\s*[:：]\s*)+", re.IGNORECASE)
+SUBJECT_MARKER = re.compile(r"\[(?:AI会话|(?i:AIChat)|完成通知)\]")
+SUBJECT_FIELD = re.compile(r"\[([^\[\]\r\n]*)\]\s*")
+NOTICE_WITH_CONTINUATION = re.compile(r"\[完成通知\](?:\[[^\[\]\r\n]*\]){2}\[续聊码 ([0-9a-f]{24})\]")
+RESERVED_DEVICE_NAMES = {"aichat", "ai会话", "完成通知"}
+INVALID_DEVICE_NAME = "设备名须含 1–32 个汉字、英文字母、数字或连字符，首尾不能是连字符，也不能使用保留名称。"
 
 # Match a direct instruction at the start of a clause. Wrapper punctuation is optional.
 MAILBOX = r"[a-z0-9_%+\-]+(?:\.[a-z0-9_%+\-]+)*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+"
@@ -123,6 +129,59 @@ def write_json(path, value):
         pending_path.replace(path)
     finally:
         pending_path.unlink(missing_ok=True)
+
+
+def normalize_device_name(value):
+    if not isinstance(value, str):
+        raise ValueError(INVALID_DEVICE_NAME)
+    value = value.strip()
+    if not value:
+        return ""
+    normalized = value.lower()
+    if (
+        len(value) > 32 or value.startswith("-") or value.endswith("-") or normalized in RESERVED_DEVICE_NAMES
+        or not all(
+            char == "-" or (char.isascii() and char.isalnum()) or char == "〇"
+            or unicode_name(char, "").startswith(("CJK UNIFIED IDEOGRAPH-", "CJK COMPATIBILITY IDEOGRAPH-"))
+            for char in value
+        )
+    ):
+        raise ValueError(INVALID_DEVICE_NAME)
+    return normalized
+
+
+def split_subject_device(subject):
+    if SUBJECT_MARKER.match(subject):
+        return "", subject
+    first = SUBJECT_FIELD.match(subject)
+    if not first or not SUBJECT_MARKER.match(subject, first.end()):
+        return "", subject
+    device = first[1]
+    if not device or device.strip() != device:
+        raise ValueError(INVALID_DEVICE_NAME)
+    return normalize_device_name(device), subject[first.end():]
+
+
+def with_device_name(subject, device_name):
+    if not device_name:
+        return subject
+    subject = REPLY_PREFIX.sub("", subject.strip()).strip()
+    previous_name, base = split_subject_device(subject)
+    if previous_name == device_name:
+        return subject
+    if not SUBJECT_MARKER.match(base):
+        base = f"[完成通知] {base}" if base else "[完成通知]"
+    return f"[{device_name}]{base}"
+
+
+def local_device_name():
+    try:
+        config = json.loads(SETTINGS.with_name("inbox-settings.json").read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return ""
+    if not isinstance(config, dict):
+        raise ValueError("收信配置须为 JSON 对象。")
+    return normalize_device_name(config.get("device_name", ""))
 
 
 def prompt_default_recipient(timeout, *, edit=False, current=""):
@@ -251,35 +310,57 @@ def remember_reply_route(message_id, mailbox, recipient, subject, thread_id):
         )
 
 
-def find_reply_chat(mailbox, recipient, subject, in_reply_to, references):
+def find_reply_chat(mailbox, recipient, subject, in_reply_to, references, *, device_name=""):
     if not REPLY_ROUTES.is_file():
         return None
     with closing(sqlite3.connect(REPLY_ROUTES.as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
         scope = (mailbox.casefold(), recipient.casefold())
-        for ids in (in_reply_to, references):
-            if not ids:
-                continue
+        ids = in_reply_to or references
+        if ids:
             placeholders = ",".join("?" for _ in ids)
             matches = db.execute(
-                f"SELECT DISTINCT thread_id FROM reply_routes WHERE mailbox=? AND recipient=? AND message_id IN ({placeholders})",
+                "SELECT DISTINCT thread_id, subject FROM reply_routes "
+                f"WHERE mailbox=? AND recipient=? AND message_id IN ({placeholders})",
                 (*scope, *ids),
             ).fetchall()
-            if matches:
-                return _unique_reply_chat(matches)
-        plain_subject, removed = REPLY_PREFIX.subn("", subject)
-        if not removed:
-            return None
-        matches = db.execute(
-            "SELECT DISTINCT thread_id FROM reply_routes WHERE mailbox=? AND recipient=? AND subject=?",
-            (*scope, plain_subject.strip()),
-        ).fetchall()
-        return _unique_reply_chat(matches)
+        else:
+            plain_subject, removed = REPLY_PREFIX.subn("", subject)
+            plain_subject = plain_subject.strip()
+            if not removed:
+                return None
+            _, notice_subject = split_subject_device(plain_subject)
+            code = NOTICE_WITH_CONTINUATION.fullmatch(notice_subject)
+            if not code:
+                return None
+            # A genuine completion notice includes its issued code in its Message-ID.
+            matches = db.execute(
+                """SELECT DISTINCT route.thread_id, route.subject FROM reply_routes AS route
+                   WHERE route.mailbox=? AND route.recipient=? AND route.subject=?
+                   AND EXISTS (
+                       SELECT 1 FROM reply_routes AS notice
+                       WHERE notice.mailbox=route.mailbox AND notice.recipient=route.recipient
+                       AND notice.thread_id=route.thread_id AND notice.message_id LIKE ?
+                   )""",
+                (*scope, plain_subject, f"%.{code[1]}@%>"),
+            ).fetchall()
+    thread_ids = {thread for thread, registered_subject in matches if _matches_reply_device(registered_subject, device_name)}
+    return _unique_reply_chat(thread_ids)
 
 
-def _unique_reply_chat(rows):
-    if len(rows) > 1:
+def _matches_reply_device(subject, device_name):
+    if not device_name:
+        return True
+    try:
+        registered, _ = split_subject_device(subject)
+    except ValueError:
+        return False
+    return registered == device_name
+
+
+def _unique_reply_chat(thread_ids):
+    if len(thread_ids) > 1:
         raise ValueError("回复关联到多条会话，请直接回复原始通知邮件。")
-    return rows[0][0] if rows else None
+    return next(iter(thread_ids), None)
 
 
 def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None, reply=None):
@@ -294,8 +375,8 @@ def send_notice(*, test, recipient=None, subject=None, body=None, thread_id=None
     domain = sender.rsplit("@", 1)[1]
     base_subject = "Codex QQ 邮箱测试" if test else subject
     if reply:
-        parent_id, references, client_id = reply
-        message["Message-ID"] = f"<codex-qqmailchat.{client_id}@{domain}>"
+        parent_id, references, reply_id = reply
+        message["Message-ID"] = f"<codex-qqmailchat.{reply_id}@{domain}>"
         message["In-Reply-To"] = parent_id
         chain = [ref for ref in references if ref != parent_id]
         message["References"] = " ".join([*chain[-49:], parent_id])
@@ -559,7 +640,7 @@ def project_and_chat(event):
 
 def notice_content(event, question):
     workspace, chat = project_and_chat(event)
-    subject = f"[完成通知][{workspace}][{chat}]"
+    subject = with_device_name(f"[完成通知][{workspace}][{chat}]", local_device_name())
     return subject, notice_body(question, event.get("last_assistant_message"))
 
 
