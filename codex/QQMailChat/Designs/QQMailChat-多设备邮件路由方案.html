@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QQMailChat 多设备邮件路由方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      color: #202b35;
+      background: #f3f5f7;
+      --accent: #075d55;
+      --line: #dbe3e7;
+      --muted: #51616c;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; font-size: 16px; line-height: 1.7; }
+    a { color: var(--accent); text-underline-offset: 0.22em; }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .page { max-width: 1240px; margin: 0 auto; padding: 36px 36px 56px; }
+    .hero {
+      display: flex;
+      flex-direction: column;
+      padding: clamp(24px, 5vw, 52px);
+      background: #163635;
+      color: #fff;
+      border: 1px solid #163635;
+      border-radius: 18px;
+      margin-bottom: 24px;
+    }
+    .hero h1 { font-size: clamp(1.65rem, 4vw, 2.7rem); line-height: 1.2; margin: 0 0 16px; }
+    .hero .status {
+      order: -1;
+      color: #d0e9e2;
+      font-size: 0.88rem;
+      margin: 0 0 12px;
+    }
+    .hero p { margin: 0; max-width: 55em; }
+    .hero code { background: #29504d; color: #fff; }
+    .layout {
+      display: grid;
+      grid-template-columns: 13rem minmax(0, 1fr);
+      align-items: start;
+      gap: 24px;
+    }
+    nav {
+      position: sticky;
+      top: 18px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+    }
+    nav h2 { margin: 0 0 8px; color: var(--muted); font-size: 0.85rem; }
+    nav a {
+      display: block;
+      padding: 6px 8px;
+      color: #214a46;
+      text-decoration: none;
+      border-radius: 6px;
+      font-size: 0.94rem;
+    }
+    nav a:hover { background: #e8f4ef; text-decoration: underline; }
+    article {
+      min-width: 0;
+      padding: 28px clamp(20px, 4vw, 46px) 34px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      overflow-wrap: anywhere;
+    }
+    section + section { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 24px; }
+    section h2 { margin: 0 0 13px; font-size: 1.4rem; line-height: 1.35; scroll-margin-top: 16px; }
+    section h2:target { color: var(--accent); }
+    section p, section ol { margin: 0 0 14px; }
+    section ol { padding-inline-start: 1.6em; }
+    section li + li { margin-top: 7px; }
+    section > :last-child { margin-bottom: 0; }
+    .table-wrap { margin: 0 0 16px; border: 1px solid var(--line); border-radius: 8px; }
+    table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 0.96rem; }
+    th, td { text-align: left; vertical-align: top; padding: 9px 13px; }
+    th { background: #eaf3f1; color: #214a46; }
+    th:first-child { width: 36%; border-top-left-radius: 7px; }
+    th:last-child { border-top-right-radius: 7px; }
+    td { border-top: 1px solid var(--line); }
+    tbody tr:nth-child(even) { background: #f8fafb; }
+    code {
+      background: #ebf4f2;
+      color: #15443f;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+      padding: 0.07em 0.28em;
+      border-radius: 4px;
+      font-size: 0.91em;
+    }
+    pre {
+      overflow: auto;
+      background: #eff5f4;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      margin: 0 0 16px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.6;
+    }
+    pre code { background: transparent; padding: 0; }
+    @media (max-width: 760px) {
+      .page { padding: 15px 12px 30px; }
+      .layout { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+      .hero { margin-bottom: 14px; border-radius: 12px; }
+      nav { position: static; display: flex; flex-wrap: wrap; align-items: center; gap: 0 5px; padding: 8px 10px; }
+      nav h2 { flex: 0 0 100%; margin: 4px 8px; }
+    }
+    @media (max-width: 440px) {
+      article { padding: 20px 13px; }
+      th, td { padding: 7px 8px; }
+      table { font-size: 0.88rem; }
+    }
+    @media print {
+      :root, .hero, article, th, tbody tr:nth-child(even) { background: #fff; color: #202b35; }
+      .page { max-width: none; padding: 0; }
+      .hero, article { padding: 0; border: 0; }
+      .hero .status, .hero code { color: #202b35; background: #fff; }
+      nav { display: none; }
+      .layout { display: block; }
+      h2, thead { break-after: avoid; }
+      tr, pre { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+<h1>QQMailChat 多设备邮件路由方案</h1>
+<p class="status"><strong>审核稿</strong> · 2026 年 11 月 28 日</p>
+<p>多台电脑可以共用一个 QQ 邮箱。在 <code>[AICHAT]</code> 前加 <code>[office-pc]</code> 就能指定办公室电脑。省略设备名时，各台监听器都会按原规则处理这封指令。设备名在每台电脑上单独设置。</p>
+    </header>
+    <div class="layout">
+      <nav aria-label="方案目录">
+        <h2>目录</h2>
+<a href="#current">1. 现状与问题</a>
+<a href="#subject">2. 发信时怎么选电脑</a>
+<a href="#routing">3. 监听器如何决定是否执行</a>
+<a href="#replies">4. 完成通知与直接回复</a>
+<a href="#rollout">5. 在每台电脑上设置设备名</a>
+<a href="#acceptance">6. 验收与审核</a>
+      </nav>
+      <article aria-label="方案正文">
+<section aria-labelledby="current">
+<h2 id="current">1. 现状与问题</h2>
+<p>QQMailChat 安装的技能名是 <code>qq-mail-notify</code>。它通过 SMTP 发送 Codex 完成通知，通过本机 IMAP 监听器收取邮件，并用本机 Codex App Server 发起或继续会话。现有主题 <code>[AI会话][工作目录][会话名]</code> 和 <code>[AI会话][会话ID]</code> 只描述会话。同一封邮件在办公室电脑和家里电脑都可能通过校验并执行。两边都找不到同名会话时，还可能分别新建会话。 <a href="../skills/qq-mail-notify/SKILL.md">技能说明</a> · <a href="../codex_qq_inbox.py#L517">会话定位</a></p>
+<p>收件箱以只读方式打开，读取使用 <code>BODY.PEEK</code>。每台电脑各自保存 UID 游标、提交记录、回复关联和进程锁。用同一个 QQ 邮箱登录的监听器可以分别扫描同一封邮件，现有 <code>Message-ID</code> 去重只在本机生效。监听器优先连接本机 Codex 服务，连接失败时可启动本机 App Server，所以设备标记选中的是当前 Windows 用户和 <code>CODEX_HOME</code> 下的会话环境。 <a href="../codex_qq_inbox.py#L379">收件与游标</a> · <a href="../codex_qq_inbox.py#L580">提交去重</a> · <a href="../codex_qq_inbox.py#L175">本机服务连接</a></p>
+</section>
+
+<section aria-labelledby="subject">
+<h2 id="subject">2. 发信时怎么选电脑</h2>
+<p>例如，办公室电脑配置 <code>office-pc</code>，家里电脑配置 <code>home-pc</code>。所有指令仍发到同一个 QQ 邮箱。</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th scope="col">操作</th>
+<th scope="col">邮件主题示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>在办公室电脑按目录和名称定位或新建会话</td>
+<td><code>[office-pc][AICHAT][工具目录][构建排查]</code></td>
+</tr>
+<tr>
+<td>在家里电脑按名称使用 <code>Global</code> 会话</td>
+<td><code>[home-pc][AICHAT][构建排查]</code></td>
+</tr>
+<tr>
+<td>按完整 ID 继续办公室电脑的已有会话</td>
+<td><code>[office-pc][AICHAT][01234567-89ab-4def-8123-456789abcdef]</code></td>
+</tr>
+<tr>
+<td>省略设备名，按原规则处理</td>
+<td><code>[AICHAT][工具目录][构建排查]</code></td>
+</tr>
+<tr>
+<td>接着上一轮聊</td>
+<td>直接回复收到的邮件，保留客户端生成的 <code>Re:</code> 或 <code>回复：</code> 以及原主题</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>设备名可用 1–32 个汉字、英文字母、数字或连字符，首尾用汉字、字母或数字。比如 <code>office-pc</code> 或 <code>办公室</code>。英文字母忽略大小写。<code>AIChat</code>、<code>AI会话</code> 和 <code>完成通知</code> 是保留名称。同一邮箱下各台电脑应使用不同的设备名。</p>
+<p>第一段若为 <code>[AICHAT]</code> 或 <code>[AI会话]</code>，直接按原主题语法解析。第一段若是设备名，第二段必须是 <code>[AICHAT]</code> 或 <code>[AI会话]</code>。<code>[AICHAT]</code> 继续接受任意大小写，会话名、工作目录和完整会话 ID 的解析规则照用。旧版只识别以指令标记开头的主动指令，所以带设备名的短格式需要目标电脑先升级。 <a href="../codex_qq_inbox.py#L38">旧版主题解析</a></p>
+</section>
+
+<section aria-labelledby="routing">
+<h2 id="routing">3. 监听器如何决定是否执行</h2>
+<p>监听器先识别自动邮件、主动指令和回复。主动指令有设备名时，先与本机设备名比较。匹配或者省略设备名时，再按原规则校验发件人、定位本机会话并提交。跳过发给其他设备的邮件时，只推进本机 UID 游标。收件箱仍为只读，各台电脑可各自读取同一封邮件。</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th scope="col">邮件情况</th>
+<th scope="col">本机处理方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主动指令的设备名匹配本机</td>
+<td>校验通过后按工作目录、会话名或本机完整 ID 提交。会话忙时按现有规则排队。</td>
+</tr>
+<tr>
+<td>主动指令未写设备名</td>
+<td>直接进入原有处理流程。每台在线监听器及之后恢复轮询的监听器都可能执行同一封邮件。只想在一台电脑执行时，请写设备名。</td>
+</tr>
+<tr>
+<td>设备名与本机不匹配、格式无效，或本机未设置设备名</td>
+<td>本机跳过带设备名前缀的指令。若没有任何设备匹配，也就没有失败回执。</td>
+</tr>
+<tr>
+<td>发件人校验通过，但目标会话或工作目录无法定位</td>
+<td>沿用现有失败回执。若指定的完整 ID 在本机不存在，返回找不到会话。</td>
+</tr>
+<tr>
+<td>自动完成邮件、自动回信或身份校验失败</td>
+<td>不触发 Codex 轮次。非目标电脑也不会发回执。</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>QQ 邮箱发给自己时，用相同的本机路由配置解析收件箱邮件和「已发送」中的副本，再比对两者。外部主动指令与回复沿用各自的身份校验规则。同一封邮件的 <code>Message-ID</code> 继续由本机 SQLite 和进程锁去重。 <a href="../codex_qq_inbox.py#L412">发件身份校验</a> · <a href="../codex_qq_inbox.py#L678">失败回执</a></p>
+<p>上线时可以用 <code>check</code> 核对每台电脑的设备名。若两台电脑误用同一个名字，两台都有可能执行同一封带名前缀的邮件。设备离线期间，只要已经建立收件起点、邮件仍在收件箱且 <code>UIDVALIDITY</code> 没有变化，恢复监听后就会从本机游标继续读取。首次运行以及 <code>UIDVALIDITY</code> 变化后，现有逻辑会按当前收件箱建立新起点。 <a href="../codex_qq_inbox.py#L800">收件起点</a></p>
+</section>
+
+<section aria-labelledby="replies">
+<h2 id="replies">4. 完成通知与直接回复</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th scope="col">邮件</th>
+<th scope="col">发出的主题示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Codex 本机任务的完成通知</td>
+<td><code>[office-pc][完成通知][工具目录][构建排查][续聊码 …]</code></td>
+</tr>
+<tr>
+<td>主动指令完成后的回信，或失败回执</td>
+<td><code>Re: [office-pc][AICHAT][工具目录][构建排查]</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>本机已设置设备名时，完成通知和回信都会带上设备名。来信已有匹配的设备名时，回信保留原前缀。未设置设备名时沿用原主题格式。成功回信和失败回执继续保留 <code>In-Reply-To</code> 和 <code>References</code>。由于无设备名前缀的指令可能由多台电脑处理，每封回信在登记时生成并保存自己的 <code>Message-ID</code>，同一封回信重试时沿用该值。完成通知继续生成续聊码。</p>
+<ol>
+<li>有回复前缀或回复头的邮件进入续聊流程。主题若有设备名，先检查是否与本机匹配。只有能关联到本机已有会话的回复才会继续。</li>
+<li>在本机回复表按邮箱、原收件地址和 <code>In-Reply-To</code> 查找。缺少 <code>In-Reply-To</code> 时查 <code>References</code>，结果须唯一指向一个会话。主题带设备名时，匹配的登记记录也要有同一设备名。原收件人仍须通过身份校验。</li>
+<li>两种回复头均缺失时，用完整主题和本机已签发的续聊码做唯一匹配。普通指令的自动回信没有续聊码时，客户端需要保留回复头。</li>
+</ol>
+<p>旧的无设备名前缀通知仍可凭本机已有的邮件头关联或续聊码续聊。要改在另一台电脑执行，或给设备更名后继续旧会话，可以用当前设备名和目标电脑上的完整会话 ID 另发一封指令。失败回执也可通过改正后另发指令处理。 <a href="../codex_qq_mail.py#L240">回复关联与发信</a></p>
+</section>
+
+<section aria-labelledby="rollout">
+<h2 id="rollout">5. 在每台电脑上设置设备名</h2>
+<p>新安装时，建议在收信 <code>setup</code> 中增加「本机设备名」输入项，填 <code>office-pc</code> 或 <code>办公室</code> 即可。设备名由自己取，本机配置与 Windows 电脑名称独立。设备名可选，留空时仍处理无设备名前缀的指令。</p>
+<p>对已有安装，方案拟增加 <code>route --device-name</code>，可设置或更改本机设备名。变更前先停止监听，设置后运行 <code>check</code>，确认显示预期设备名，再启动监听。该命令只改设备名，无需重新输入邮箱授权码。以下为实现后的用法。</p>
+<pre><code class="language-powershell">$codexProfile = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$inbox = Join-Path $codexProfile 'qq-mail\codex_qq_inbox.py'
+python -I -X utf8 $inbox route --device-name office-pc
+python -I -X utf8 $inbox check
+python -I -X utf8 -u $inbox run
+</code></pre>
+<p>在家里电脑运行同一组命令，把 <code>office-pc</code> 改成 <code>home-pc</code>。设置保存为本机 <code>qq-mail/inbox-settings.json</code> 中的 <code>"device_name": "office-pc"</code>。收信监听器和发信 Hook 共用这一项。重新运行 <code>setup</code> 或更新 IMAP 凭据时保留现有设备名，<code>check</code> 和监听启动日志显示设备名及本机配置路径。 <a href="../install.py#L88">安装更新逻辑</a> · <a href="../qq_mail_credentials.py#L47">IMAP 凭据保存</a></p>
+<p>上线时，先让旧监听器处理完在途任务和回执，再依次升级并给每台电脑设置设备名。已有安装沿用游标。新安装等到「已记录收件起点」再发测试邮件。升级后可直接用旧格式发送不指定设备的指令。</p>
+</section>
+
+<section aria-labelledby="acceptance">
+<h2 id="acceptance">6. 验收与审核</h2>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th scope="col">场景</th>
+<th scope="col">应看到的结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两台电脑同时监听，轮流指定不同设备，且两边存在同名会话</td>
+<td>每封邮件只在指定设备的目标会话产生一轮，只有该设备回信。</td>
+</tr>
+<tr>
+<td>两台电脑同时监听，收到无设备名前缀的主动指令</td>
+<td>两台都按原规则处理。若同一指令产生两封回信，各有自己的设备名和 <code>Message-ID</code>，直接回复其中一封只续聊它对应的会话。</td>
+</tr>
+<tr>
+<td>设备名拼错、格式无效、大小写不同，或本机未设置设备名</td>
+<td>拼错和格式无效时无轮次、无回执。有效设备名的英文大小写不影响匹配。未命名的本机只处理无设备名前缀的主动指令。</td>
+</tr>
+<tr>
+<td>旧版解析器收到带设备名的短格式指令</td>
+<td>旧版不把带前缀的主题当作主动指令。原来的无前缀主题仍按原语法解析。</td>
+</tr>
+<tr>
+<td>设备正确但本机没有指定会话 ID，或发件人未授权</td>
+<td>前者由目标设备发一封失败回执，后者无轮次、无回执。</td>
+</tr>
+<tr>
+<td>QQ 邮箱发给自己，或从允许列表中的外部邮箱发指令</td>
+<td>分别通过已发送副本比对或现有外部身份校验，两种方式都只在目标设备执行。</td>
+</tr>
+<tr>
+<td>直接回复成功邮件或旧的完成通知、手工改设备名、客户端省略回复头</td>
+<td>正常回复回原会话。修改主题中的设备名不会把回复转给另一台电脑。无回复头时，可用已签发且能唯一匹配的续聊码继续。</td>
+</tr>
+<tr>
+<td>目标电脑重启、重复收到同一 <code>Message-ID</code>、另一台电脑持续在线</td>
+<td>目标电脑从本机游标恢复，成功提交一次。另一台电脑保持零轮次。</td>
+</tr>
+<tr>
+<td>设置设备名后更新凭据、重启监听，或在本机更改设备名</td>
+<td>更新凭据和重启后显示原设备名。更名后，新指令和新通知使用新设备名。</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>自动化验收用两个独立本地状态库模拟同一收件箱。实施后用两台实机验证 QQ IMAP 并发登录，以及 QQ 邮箱客户端能否保留回信的主题和邮件头。本稿供审核，设备名设置命令及邮件分流规则将在实现后生效。</p>
+</section>
+      </article>
+    </div>
+  </main>
+</body>
+</html>

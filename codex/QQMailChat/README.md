@@ -1,6 +1,6 @@
 # QQMailChat
 
-[QQMailChat UML 活动图](./QQMailChat-流程图.html) 展示邮件发起、会话排队、自动回信和本机完成通知的处理流程。下载 HTML 后可离线打开。
+[QQMailChat UML 活动图](./Designs/QQMailChat-流程图.html) 展示邮件发起、会话排队、自动回信和本机完成通知的处理流程。下载 HTML 后可离线打开。
 
 通过 QQ 邮箱接收本地 Codex 的完成通知、发邮件新建或继续会话，以及直接回复通知继续原会话。
 
